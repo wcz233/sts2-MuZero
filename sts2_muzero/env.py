@@ -276,7 +276,7 @@ OBSERVATION_SIZE = len(extract_observation_features({"state_type": "menu"}))
 
 
 class STS2MuZeroEnv:
-    def __init__(self, bridge: STS2Bridge, poll_interval: float = 0.15, max_poll_attempts: int = 6) -> None:
+    def __init__(self, bridge: STS2Bridge, poll_interval: float = 0.15, max_poll_attempts: int = 20) -> None:
         self.bridge = bridge
         self.poll_interval = poll_interval
         self.max_poll_attempts = max_poll_attempts
@@ -284,6 +284,70 @@ class STS2MuZeroEnv:
 
     def fetch_state(self) -> dict[str, object]:
         return self.bridge.get_game_state(format="json")
+
+    def _is_combat_action_window_ready(self, state: dict[str, object]) -> bool:
+        if str(state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return False
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        hand_mode = str(battle.get("hand_mode", "play") or "play").lower()
+        return (
+            battle.get("turn") == "player"
+            and bool(battle.get("is_play_phase"))
+            and not bool(battle.get("player_actions_disabled"))
+            and not bool(battle.get("hand_in_card_play"))
+            and hand_mode == "play"
+        )
+
+    def _combat_progress_signature(self, state: dict[str, object]) -> tuple[object, ...]:
+        state_type = str(state.get("state_type", "unknown"))
+        run = state.get("run") if isinstance(state.get("run"), dict) else {}
+        player = state.get("player") if isinstance(state.get("player"), dict) else {}
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        hand_cards = player.get("hand", []) if isinstance(player.get("hand"), list) else []
+        enemies = battle.get("enemies", []) if isinstance(battle.get("enemies"), list) else []
+        hand_select = state.get("hand_select") if isinstance(state.get("hand_select"), dict) else {}
+        hand_signature = tuple(
+            (
+                int(card.get("index", -1)),
+                str(card.get("name", "")),
+                bool(card.get("can_play")),
+                str(card.get("cost", "")),
+                str(card.get("target_type", "")),
+            )
+            for card in hand_cards
+            if isinstance(card, dict)
+        )
+        enemy_signature = tuple(
+            (
+                str(enemy.get("entity_id", "")),
+                float(enemy.get("hp", 0) or 0),
+                float(enemy.get("block", 0) or 0),
+            )
+            for enemy in enemies
+            if isinstance(enemy, dict)
+        )
+        selectable_cards = hand_select.get("cards", []) if isinstance(hand_select.get("cards"), list) else []
+        selected_cards = hand_select.get("selected_cards", []) if isinstance(hand_select.get("selected_cards"), list) else []
+        return (
+            state_type,
+            int(run.get("act", 0) or 0),
+            int(run.get("floor", 0) or 0),
+            battle.get("round"),
+            str(battle.get("turn", "")),
+            bool(battle.get("is_play_phase")),
+            bool(battle.get("player_actions_disabled")),
+            bool(battle.get("hand_in_card_play")),
+            str(battle.get("hand_mode", "")),
+            float(player.get("hp", 0) or 0),
+            float(player.get("block", 0) or 0),
+            float(player.get("energy", 0) or 0),
+            hand_signature,
+            enemy_signature,
+            hand_select.get("mode"),
+            len(selectable_cards),
+            len(selected_cards),
+            bool(hand_select.get("can_confirm")),
+        )
 
     def build_legal_action_map(self, state: dict[str, object]) -> dict[int, BoundAction]:
         actions: dict[int, BoundAction] = {}
@@ -295,7 +359,7 @@ class STS2MuZeroEnv:
         if not oversized_hand:
             self._disable_play_card_above_ten = False
 
-        if state_type in COMBAT_STATE_TYPES and battle.get("turn") == "player" and battle.get("is_play_phase"):
+        if self._is_combat_action_window_ready(state):
             enemies = [
                 enemy
                 for enemy in battle.get("enemies", [])
@@ -474,7 +538,7 @@ class STS2MuZeroEnv:
         bound = legal_actions[action_id]
         try:
             response = self.bridge.call_tool(bound.tool_name, **bound.kwargs)
-            next_state = self._poll_state(bound.tool_name)
+            next_state = self._poll_state(bound.tool_name, state)
         except STS2BridgeError as exc:
             error_text = str(exc)
             compatibility_workaround = None
@@ -528,20 +592,28 @@ class STS2MuZeroEnv:
         shop_state = state.get("shop")
         return shop_state if isinstance(shop_state, dict) else {}
 
-    def _poll_state(self, tool_name: str) -> dict[str, object]:
+    def _poll_state(self, tool_name: str, previous_state: dict[str, object]) -> dict[str, object]:
         state = self.fetch_state()
         for _ in range(self.max_poll_attempts):
-            if not self._needs_extra_poll(tool_name, state):
+            if not self._needs_extra_poll(tool_name, previous_state, state):
                 return state
             time.sleep(self.poll_interval)
             state = self.fetch_state()
         return state
 
-    def _needs_extra_poll(self, tool_name: str, state: dict[str, object]) -> bool:
+    def _needs_extra_poll(self, tool_name: str, previous_state: dict[str, object], state: dict[str, object]) -> bool:
         state_type = str(state.get("state_type", "unknown"))
+        previous_signature = self._combat_progress_signature(previous_state)
+        current_signature = self._combat_progress_signature(state)
+        if tool_name in {"combat_play_card", "combat_end_turn", "use_potion", "discard_potion", "combat_select_card", "combat_confirm_selection"}:
+            if current_signature == previous_signature:
+                return True
         if tool_name == "combat_end_turn" and state_type in COMBAT_STATE_TYPES:
+            return not self._is_combat_action_window_ready(state)
+        if tool_name in {"combat_play_card", "use_potion", "discard_potion", "combat_select_card", "combat_confirm_selection"} and state_type in COMBAT_STATE_TYPES:
             battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
-            return battle.get("turn") != "player" or not battle.get("is_play_phase")
+            hand_mode = str(battle.get("hand_mode", "play") or "play").lower()
+            return bool(battle.get("player_actions_disabled")) or bool(battle.get("hand_in_card_play")) or hand_mode != "play"
         if state_type == "treasure" and isinstance(state.get("treasure"), dict):
             treasure = state["treasure"]
             return bool(treasure.get("message")) and not treasure.get("relics")
