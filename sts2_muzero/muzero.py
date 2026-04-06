@@ -1,6 +1,7 @@
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,9 @@ class Transition:
     next_observation: list[float]
     done: bool
     policy_target: list[float]
+    combat_end: bool = False
+    act_end: bool = False
+    run_end: bool = False
 
 
 @dataclass
@@ -80,8 +84,32 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self.items)
 
-    def sample(self, rng: random.Random) -> Transition:
-        return self.items[rng.randrange(len(self.items))]
+    def sample(self, rng: random.Random, weight_fn: Callable[[Transition], float] | None = None) -> Transition:
+        if weight_fn is None:
+            return self.items[rng.randrange(len(self.items))]
+        total_weight = 0.0
+        weights: list[float] = []
+        for item in self.items:
+            weight = max(0.0, float(weight_fn(item)))
+            weights.append(weight)
+            total_weight += weight
+        if total_weight <= 0.0:
+            return self.items[rng.randrange(len(self.items))]
+        cutoff = rng.random() * total_weight
+        cumulative = 0.0
+        for item, weight in zip(self.items, weights):
+            cumulative += weight
+            if cutoff <= cumulative:
+                return item
+        return self.items[-1]
+
+    def boundary_counts(self) -> dict[str, int]:
+        return {
+            "total": len(self.items),
+            "combat_end": sum(1 for item in self.items if item.combat_end),
+            "act_end": sum(1 for item in self.items if item.act_end),
+            "run_end": sum(1 for item in self.items if item.run_end),
+        }
 
 
 class LinearLayer:
@@ -93,9 +121,15 @@ class LinearLayer:
         self.biases = [0.0 for _ in range(output_size)]
 
     def forward(self, inputs: list[float]) -> list[float]:
+        if len(inputs) != self.input_size:
+            raise ValueError(f"Expected {self.input_size} inputs, received {len(inputs)}")
         return [_dot(row, inputs) + bias for row, bias in zip(self.weights, self.biases)]
 
     def backward(self, inputs: list[float], grad_outputs: list[float], learning_rate: float) -> list[float]:
+        if len(inputs) != self.input_size:
+            raise ValueError(f"Expected {self.input_size} inputs, received {len(inputs)}")
+        if len(grad_outputs) != self.output_size:
+            raise ValueError(f"Expected {self.output_size} output gradients, received {len(grad_outputs)}")
         grad_inputs = [0.0 for _ in range(self.input_size)]
         for row_index, raw_grad in enumerate(grad_outputs):
             grad = _clamp(raw_grad)
@@ -112,9 +146,28 @@ class LinearLayer:
     def state_dict(self) -> dict[str, object]:
         return {"weights": self.weights, "biases": self.biases}
 
-    def load_state_dict(self, state: dict[str, object]) -> None:
-        self.weights = [[float(value) for value in row] for row in state["weights"]]  # type: ignore[index]
-        self.biases = [float(value) for value in state["biases"]]  # type: ignore[index]
+    def load_state_dict(self, state: dict[str, object]) -> str | None:
+        raw_weights = state.get("weights")
+        raw_biases = state.get("biases")
+        if not isinstance(raw_weights, list) or not isinstance(raw_biases, list):
+            raise ValueError("Invalid layer state")
+
+        source_weights = [[float(value) for value in row] for row in raw_weights if isinstance(row, list)]
+        source_biases = [float(value) for value in raw_biases]
+        source_output_size = len(source_weights)
+        source_input_size = max((len(row) for row in source_weights), default=0)
+
+        for row_index in range(min(self.output_size, source_output_size)):
+            source_row = source_weights[row_index]
+            for input_index in range(min(self.input_size, len(source_row))):
+                self.weights[row_index][input_index] = source_row[input_index]
+
+        for bias_index in range(min(self.output_size, len(source_biases))):
+            self.biases[bias_index] = source_biases[bias_index]
+
+        if source_output_size != self.output_size or source_input_size != self.input_size:
+            return f"{source_output_size}x{source_input_size}->{self.output_size}x{self.input_size}"
+        return None
 
 
 class TanhLinearLayer(LinearLayer):
@@ -182,12 +235,22 @@ class MuZeroNetwork:
             "value_head": self.value_head.state_dict(),
         }
 
-    def load_state_dict(self, state: dict[str, object]) -> None:
-        self.representation.load_state_dict(state["representation"])  # type: ignore[index]
-        self.dynamics.load_state_dict(state["dynamics"])  # type: ignore[index]
-        self.reward_head.load_state_dict(state["reward_head"])  # type: ignore[index]
-        self.policy_head.load_state_dict(state["policy_head"])  # type: ignore[index]
-        self.value_head.load_state_dict(state["value_head"])  # type: ignore[index]
+    def load_state_dict(self, state: dict[str, object]) -> list[str]:
+        migrations: list[str] = []
+        for name, layer in (
+            ("representation", self.representation),
+            ("dynamics", self.dynamics),
+            ("reward_head", self.reward_head),
+            ("policy_head", self.policy_head),
+            ("value_head", self.value_head),
+        ):
+            layer_state = state.get(name)
+            if not isinstance(layer_state, dict):
+                raise ValueError(f"Missing layer state: {name}")
+            migration = layer.load_state_dict(layer_state)
+            if migration:
+                migrations.append(f"{name} {migration}")
+        return migrations
 
 
 class MuZeroAgent:
@@ -204,6 +267,9 @@ class MuZeroAgent:
         seed: int = 7,
         dirichlet_alpha: float = 0.3,
         exploration_fraction: float = 0.25,
+        combat_end_sample_bonus: float = 1.0,
+        act_end_sample_bonus: float = 3.0,
+        run_end_sample_bonus: float = 7.0,
     ) -> None:
         self.network = MuZeroNetwork(observation_size, action_size, hidden_size, seed)
         self.learning_rate = learning_rate
@@ -212,6 +278,9 @@ class MuZeroAgent:
         self.warmup_samples = warmup_samples
         self.dirichlet_alpha = dirichlet_alpha
         self.exploration_fraction = exploration_fraction
+        self.combat_end_sample_bonus = combat_end_sample_bonus
+        self.act_end_sample_bonus = act_end_sample_bonus
+        self.run_end_sample_bonus = run_end_sample_bonus
         self.replay = ReplayBuffer(replay_capacity)
         self.rng = random.Random(seed + 17)
         self.training_steps = 0
@@ -278,12 +347,25 @@ class MuZeroAgent:
     def remember(self, transition: Transition) -> None:
         self.replay.append(transition)
 
+    def replay_boundary_counts(self) -> dict[str, int]:
+        return self.replay.boundary_counts()
+
+    def _replay_weight(self, transition: Transition) -> float:
+        weight = 1.0
+        if transition.combat_end:
+            weight += self.combat_end_sample_bonus
+        if transition.act_end:
+            weight += self.act_end_sample_bonus
+        if transition.run_end:
+            weight += self.run_end_sample_bonus
+        return weight
+
     def learn(self, updates: int) -> TrainMetrics | None:
         if len(self.replay) < self.warmup_samples or updates <= 0:
             return None
         metrics = TrainMetrics()
         for _ in range(updates):
-            sample = self.replay.sample(self.rng)
+            sample = self.replay.sample(self.rng, self._replay_weight)
             current = self._train_transition(sample)
             metrics.total_loss += current.total_loss
             metrics.value_loss += current.value_loss
@@ -335,17 +417,44 @@ class MuZeroAgent:
             "simulations": self.simulations,
             "warmup_samples": self.warmup_samples,
             "training_steps": self.training_steps,
+            "replay_weights": {
+                "combat_end_sample_bonus": self.combat_end_sample_bonus,
+                "act_end_sample_bonus": self.act_end_sample_bonus,
+                "run_end_sample_bonus": self.run_end_sample_bonus,
+            },
+            "architecture": {
+                "observation_size": self.network.observation_size,
+                "action_size": self.network.action_size,
+                "hidden_size": self.network.hidden_size,
+            },
             "network": self.network.state_dict(),
         }
         destination.write_text(json.dumps(payload), encoding="utf-8")
 
-    def load(self, path: str | Path) -> None:
+    def load(self, path: str | Path) -> list[str]:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         self.learning_rate = float(payload.get("learning_rate", self.learning_rate))
         self.discount = float(payload.get("discount", self.discount))
         self.simulations = int(payload.get("simulations", self.simulations))
         self.warmup_samples = int(payload.get("warmup_samples", self.warmup_samples))
         self.training_steps = int(payload.get("training_steps", self.training_steps))
+        replay_weights = payload.get("replay_weights")
+        if isinstance(replay_weights, dict):
+            self.combat_end_sample_bonus = float(replay_weights.get("combat_end_sample_bonus", self.combat_end_sample_bonus))
+            self.act_end_sample_bonus = float(replay_weights.get("act_end_sample_bonus", self.act_end_sample_bonus))
+            self.run_end_sample_bonus = float(replay_weights.get("run_end_sample_bonus", self.run_end_sample_bonus))
+        migrations: list[str] = []
+        architecture = payload.get("architecture")
+        if isinstance(architecture, dict):
+            for key, current_value in (
+                ("observation_size", self.network.observation_size),
+                ("action_size", self.network.action_size),
+                ("hidden_size", self.network.hidden_size),
+            ):
+                loaded_value = architecture.get(key)
+                if isinstance(loaded_value, int) and loaded_value != current_value:
+                    migrations.append(f"{key} {loaded_value}->{current_value}")
         network_state = payload.get("network")
         if isinstance(network_state, dict):
-            self.network.load_state_dict(network_state)
+            migrations.extend(self.network.load_state_dict(network_state))
+        return migrations

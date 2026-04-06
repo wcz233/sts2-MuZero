@@ -1,10 +1,11 @@
 import argparse
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .action_space import ACTION_SPACE_SIZE
 from .bridge import STS2Bridge, STS2BridgeError
-from .env import OBSERVATION_SIZE, STS2MuZeroEnv, extract_observation_features
+from .env import COMBAT_STATE_TYPES, OBSERVATION_SIZE, STS2MuZeroEnv, extract_observation_features
 from .muzero import MuZeroAgent, Transition
 
 
@@ -93,6 +94,88 @@ def _format_metrics(metrics: object) -> str:
     )
 
 
+@dataclass
+class CombatWindow:
+    act: int
+    floor: int
+    start_step: int
+    steps: int = 0
+    reward: float = 0.0
+
+
+@dataclass
+class ActWindow:
+    act: int
+    start_floor: int
+    start_step: int
+    steps: int = 0
+    reward: float = 0.0
+    combats: int = 0
+
+
+def _run_position(state: dict[str, object]) -> tuple[int, int]:
+    run = state.get("run") if isinstance(state.get("run"), dict) else {}
+    return int(run.get("act", 0) or 0), int(run.get("floor", 0) or 0)
+
+
+def _is_combat_state(state: dict[str, object]) -> bool:
+    return str(state.get("state_type", "unknown")) in COMBAT_STATE_TYPES
+
+
+def _open_combat_window(state: dict[str, object], next_step: int) -> CombatWindow | None:
+    if not _is_combat_state(state):
+        return None
+    act, floor = _run_position(state)
+    return CombatWindow(act=act, floor=floor, start_step=next_step)
+
+
+def _open_act_window(state: dict[str, object], next_step: int) -> ActWindow:
+    act, floor = _run_position(state)
+    return ActWindow(act=act, start_floor=floor, start_step=next_step)
+
+
+def _format_boundary_suffix(transition: Transition) -> str:
+    boundaries: list[str] = []
+    if transition.combat_end:
+        boundaries.append("combat_end")
+    if transition.act_end:
+        boundaries.append("act_end")
+    if transition.run_end:
+        boundaries.append("run_end")
+    return f" boundary={','.join(boundaries)}" if boundaries else ""
+
+
+def _format_info_suffix(info: dict[str, object]) -> str:
+    response = info.get("response")
+    if not isinstance(response, dict) or response.get("status") != "error":
+        return ""
+    details: list[str] = []
+    workaround = response.get("compatibility_workaround")
+    if isinstance(workaround, str):
+        details.append(f"workaround={workaround}")
+    error_text = str(response.get("error", "")).replace("\n", " ").strip()
+    if error_text:
+        details.append(f"error={error_text}")
+    return f" {' '.join(details)}" if details else ""
+
+
+def _combat_result(next_state: dict[str, object], run_end: bool) -> str:
+    player = next_state.get("player") if isinstance(next_state.get("player"), dict) else {}
+    hp = float(player.get("hp", 0) or 0)
+    if run_end:
+        return "victory" if hp > 0 else "defeat"
+    return "victory"
+
+
+def _format_replay_counts(counts: dict[str, int]) -> str:
+    return (
+        f"replay={counts.get('total', 0)} "
+        f"combat={counts.get('combat_end', 0)} "
+        f"act={counts.get('act_end', 0)} "
+        f"run={counts.get('run_end', 0)}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Shell-first MuZero prototype for Slay the Spire 2")
     parser.add_argument("--host", default="localhost")
@@ -133,13 +216,15 @@ def main() -> None:
     )
     checkpoint_path = Path(args.checkpoint_path)
     if args.resume and checkpoint_path.exists():
-        agent.load(checkpoint_path)
-        print(f"[{_timestamp()}] loaded checkpoint from {checkpoint_path}", flush=True)
+        migrations = agent.load(checkpoint_path)
+        migration_suffix = f" migrated={' ; '.join(migrations)}" if migrations else ""
+        print(f"[{_timestamp()}] loaded checkpoint from {checkpoint_path}{migration_suffix}", flush=True)
 
     print(
         f"[{_timestamp()}] obs={OBSERVATION_SIZE} actions={ACTION_SPACE_SIZE} "
         f"hidden={args.hidden_size} simulations={args.simulations} "
-        f"character={args.character} ascension={'keep' if args.ascension < 0 else args.ascension}",
+        f"character={args.character} ascension={'keep' if args.ascension < 0 else args.ascension} "
+        f"replay_bonus=+{agent.combat_end_sample_bonus:.1f}/+{agent.act_end_sample_bonus:.1f}/+{agent.run_end_sample_bonus:.1f}",
         flush=True,
     )
 
@@ -147,9 +232,14 @@ def main() -> None:
     episode_index = 1
     episode_steps = 0
     episode_reward = 0.0
+    episode_combats = 0
     total_steps = 0
+    act_window = _open_act_window(state, total_steps + 1)
+    combat_window = _open_combat_window(state, total_steps + 1)
 
     while args.max_steps <= 0 or total_steps < args.max_steps:
+        if combat_window is None and _is_combat_state(state):
+            combat_window = _open_combat_window(state, total_steps + 1)
         legal_action_map = env.build_legal_action_map(state)
         legal_actions = sorted(legal_action_map)
         if not legal_actions:
@@ -173,6 +263,9 @@ def main() -> None:
             next_observation=extract_observation_features(next_state),
             done=done,
             policy_target=search.action_probabilities,
+            combat_end=bool(info.get("combat_end")),
+            act_end=bool(info.get("act_end")),
+            run_end=bool(info.get("run_end")),
         )
         agent.remember(transition)
         metrics = agent.learn(args.updates_per_step)
@@ -180,6 +273,11 @@ def main() -> None:
         total_steps += 1
         episode_steps += 1
         episode_reward += reward
+        act_window.steps += 1
+        act_window.reward += reward
+        if combat_window is not None:
+            combat_window.steps += 1
+            combat_window.reward += reward
 
         player = next_state.get("player") if isinstance(next_state.get("player"), dict) else {}
         run = next_state.get("run") if isinstance(next_state.get("run"), dict) else {}
@@ -187,7 +285,8 @@ def main() -> None:
             f"[{_timestamp()}] step={total_steps} ep={episode_index} act={run.get('act', '?')} floor={run.get('floor', '?')} "
             f"hp={player.get('hp', '?')}/{player.get('max_hp', '?')} state={next_state.get('state_type')} "
             f"action={info['description']} reward={reward:+.3f} ep_reward={episode_reward:+.3f} "
-            f"root_value={search.root_value:+.3f} {_format_metrics(metrics)}",
+            f"root_value={search.root_value:+.3f} {_format_metrics(metrics)}"
+            f"{_format_boundary_suffix(transition)}{_format_info_suffix(info)}",
             flush=True,
         )
 
@@ -195,17 +294,49 @@ def main() -> None:
             agent.save(checkpoint_path)
             print(f"[{_timestamp()}] checkpoint saved to {checkpoint_path}", flush=True)
 
-        if done:
+        if transition.combat_end and combat_window is not None:
+            episode_combats += 1
+            act_window.combats += 1
             print(
-                f"[{_timestamp()}] episode={episode_index} finished after {episode_steps} steps "
-                f"with shaped_return={episode_reward:+.3f}",
+                f"[{_timestamp()}] combat_end ep={episode_index} act={combat_window.act} floor={combat_window.floor} "
+                f"steps={combat_window.steps} reward={combat_window.reward:+.3f} "
+                f"result={_combat_result(next_state, transition.run_end)}",
+                flush=True,
+            )
+            combat_window = None
+
+        if transition.act_end:
+            print(
+                f"[{_timestamp()}] act_summary ep={episode_index} act={act_window.act} reason=act_end "
+                f"steps={act_window.steps} floors={act_window.start_floor}->{info.get('next_floor', run.get('floor', '?'))} "
+                f"combats={act_window.combats} reward={act_window.reward:+.3f}",
+                flush=True,
+            )
+            act_window = _open_act_window(next_state, total_steps + 1) if not transition.run_end else None
+
+        if done:
+            if act_window is not None:
+                print(
+                    f"[{_timestamp()}] act_summary ep={episode_index} act={act_window.act} reason=run_end "
+                    f"steps={act_window.steps} floors={act_window.start_floor}->{run.get('floor', '?')} "
+                    f"combats={act_window.combats} reward={act_window.reward:+.3f}",
+                    flush=True,
+                )
+            replay_counts = agent.replay_boundary_counts()
+            result = "victory" if float(player.get("hp", 0) or 0) > 0 else "defeat"
+            print(
+                f"[{_timestamp()}] run_end ep={episode_index} steps={episode_steps} combats={episode_combats} "
+                f"shaped_return={episode_reward:+.3f} result={result} {_format_replay_counts(replay_counts)}",
                 flush=True,
             )
             agent.save(checkpoint_path)
             episode_index += 1
             episode_steps = 0
             episode_reward = 0.0
+            episode_combats = 0
             state = _wait_for_run(env, args.menu_sleep, args.character, args.ascension, args.manual_start)
+            act_window = _open_act_window(state, total_steps + 1)
+            combat_window = _open_combat_window(state, total_steps + 1)
             continue
 
         state = next_state

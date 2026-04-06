@@ -28,14 +28,15 @@ The current version can also auto-dismiss post-run screens and start a fresh run
   - minimal MuZero-style representation/dynamics/prediction model
   - shallow root search
   - online SGD training
+  - boundary-weighted replay sampling for combat / act / run endings
 - `sts2_muzero/cli.py`
   - shell training loop
+  - combat / act / run summary logs
 
 ## Limitations
 
 - This is a first working prototype, not a production MuZero implementation.
 - Search is shallow because the live interface cannot clone game state.
-- The tool surface does not expose "start new run", so new episodes must still be started in-game.
 - Training speed is bounded by the live game and shell logging.
 
 ## Run
@@ -63,4 +64,8 @@ python run_training.py --manual-start
 
 ```text
 [09:12:03] step=18 ep=1 act=1 floor=4 hp=63/80 state=monster action=play Strike -> Jaw Worm reward=+1.240 ep_reward=+8.510 root_value=+0.318 loss=0.9412 value=0.2115 reward=0.0321 policy=0.5943 consistency=0.1033
+[09:12:17] step=26 ep=1 act=1 floor=4 hp=58/80 state=rewards action=end turn reward=+8.420 ep_reward=+16.930 root_value=+0.502 loss=0.8841 value=0.1932 reward=0.0510 policy=0.5319 consistency=0.1080 boundary=combat_end
+[09:12:17] combat_end ep=1 act=1 floor=4 steps=9 reward=+10.280 result=victory
+[09:24:51] act_summary ep=1 act=1 reason=act_end steps=88 floors=1->18 combats=8 reward=+54.720
+[09:40:02] run_end ep=1 steps=173 combats=17 shaped_return=+71.580 result=defeat replay=173 combat=17 act=1 run=1
 ```
