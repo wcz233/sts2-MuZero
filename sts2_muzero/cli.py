@@ -416,6 +416,8 @@ def main() -> None:
     parser.add_argument("--allow-premature-end-turn", action="store_true", help="Pure training mode: always expose combat_end_turn even when playable combat cards exist")
     parser.add_argument("--end-turn-guard-stall-limit", type=int, default=3, help="Compatibility fallback only: used only when end-turn-guard-timeout-seconds <= 0")
     parser.add_argument("--end-turn-guard-timeout-seconds", type=float, default=3.0, help="When premature end-turn blocking is enabled, keep end turn hidden for this many seconds on the same combat search space before releasing it")
+    parser.add_argument("--allow-unseen-card-reward-proceed", action="store_true", help="Pure training mode: expose rewards proceed even before the agent has opened the card reward window")
+    parser.add_argument("--card-reward-preview-guard-timeout-seconds", type=float, default=3.0, help="When rewards contain a card reward, keep proceed hidden until the agent opens the card reward once or this timeout expires; <=0 means strict blocking until opened")
     parser.add_argument("--checkpoint-path", default="checkpoints/latest.json")
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--character", default="Ironclad", help="Character to auto-start after menu/game_over")
@@ -469,6 +471,8 @@ def main() -> None:
         block_premature_end_turn=not args.allow_premature_end_turn,
         end_turn_guard_stall_limit=args.end_turn_guard_stall_limit,
         end_turn_guard_timeout_seconds=args.end_turn_guard_timeout_seconds,
+        require_card_reward_preview_before_proceed=not args.allow_unseen_card_reward_proceed,
+        card_reward_preview_guard_timeout_seconds=args.card_reward_preview_guard_timeout_seconds,
     )
     agent = MuZeroAgent(
         observation_size=OBSERVATION_SIZE,
@@ -513,6 +517,7 @@ def main() -> None:
         f"run+:{args.run_victory_weight:.2f} run-:{args.run_defeat_weight:.2f} "
         f"shape:{args.combat_tactical_shaping:.2f} slack:{args.end_turn_slack_penalty:.2f} "
         f"end_turn_guard={'off' if args.allow_premature_end_turn else (f'on@timeout{args.end_turn_guard_timeout_seconds:.1f}s' if args.end_turn_guard_timeout_seconds > 0.0 else f'on@stall{args.end_turn_guard_stall_limit}')} "
+        f"card_reward_guard={'off' if args.allow_unseen_card_reward_proceed else (f'on@timeout{args.card_reward_preview_guard_timeout_seconds:.1f}s' if args.card_reward_preview_guard_timeout_seconds > 0.0 else 'on@strict')} "
         f"card_select_topk={args.card_select_candidate_limit}",
         flush=True,
     )

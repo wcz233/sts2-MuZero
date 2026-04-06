@@ -68,6 +68,11 @@ class RewardWeights:
     end_turn_slack_penalty: float = 0.5
 
 
+def _reward_item_is_card(item: dict[str, object]) -> bool:
+    reward_type = str(item.get("type", "")).lower()
+    return reward_type in {"card", "special_card"}
+
+
 def _bool(value: object) -> float:
     return 1.0 if value else 0.0
 
@@ -434,6 +439,8 @@ class STS2MuZeroEnv:
         block_premature_end_turn: bool = True,
         end_turn_guard_stall_limit: int = 3,
         end_turn_guard_timeout_seconds: float = 3.0,
+        require_card_reward_preview_before_proceed: bool = True,
+        card_reward_preview_guard_timeout_seconds: float = 3.0,
     ) -> None:
         self.bridge = bridge
         self.poll_interval = poll_interval
@@ -444,9 +451,14 @@ class STS2MuZeroEnv:
         self.block_premature_end_turn = block_premature_end_turn
         self.end_turn_guard_stall_limit = max(1, int(end_turn_guard_stall_limit))
         self.end_turn_guard_timeout_seconds = max(0.0, float(end_turn_guard_timeout_seconds))
+        self.require_card_reward_preview_before_proceed = require_card_reward_preview_before_proceed
+        self.card_reward_preview_guard_timeout_seconds = float(card_reward_preview_guard_timeout_seconds)
         self._disable_play_card_above_ten = False
         self._combat_stall_counts: dict[tuple[object, ...], int] = {}
         self._combat_end_turn_guard_started_at: dict[tuple[object, ...], float] = {}
+        self._card_reward_guard_anchor: tuple[int, int] | None = None
+        self._card_reward_guard_started_at: float | None = None
+        self._card_reward_preview_seen = False
         self.semantic_history = SemanticHistoryTracker()
 
     def fetch_state(self) -> dict[str, object]:
@@ -531,6 +543,87 @@ class STS2MuZeroEnv:
     def _clear_combat_guard_state(self, signature: tuple[object, ...]) -> None:
         self._combat_stall_counts.pop(signature, None)
         self._combat_end_turn_guard_started_at.pop(signature, None)
+
+    def _reset_card_reward_guard(self) -> None:
+        self._card_reward_guard_anchor = None
+        self._card_reward_guard_started_at = None
+        self._card_reward_preview_seen = False
+
+    def _card_reward_guard_anchor_for_state(self, state: dict[str, object]) -> tuple[int, int]:
+        run = state.get("run") if isinstance(state.get("run"), dict) else {}
+        return int(run.get("act", 0) or 0), int(run.get("floor", 0) or 0)
+
+    def _has_pending_card_reward_claim(self, state: dict[str, object]) -> bool:
+        rewards = state.get("rewards") if isinstance(state.get("rewards"), dict) else {}
+        items = rewards.get("items") if isinstance(rewards.get("items"), list) else []
+        return any(isinstance(item, dict) and _reward_item_is_card(item) for item in items)
+
+    def _sync_card_reward_guard_state(self, state: dict[str, object]) -> None:
+        state_type = str(state.get("state_type", "unknown"))
+        if state_type not in {"rewards", "card_reward"}:
+            self._reset_card_reward_guard()
+            return
+        anchor = self._card_reward_guard_anchor_for_state(state)
+        if self._card_reward_guard_anchor != anchor:
+            self._card_reward_guard_anchor = anchor
+            self._card_reward_guard_started_at = None
+            self._card_reward_preview_seen = False
+        if state_type == "card_reward":
+            self._card_reward_preview_seen = True
+            return
+        if not self._has_pending_card_reward_claim(state):
+            self._reset_card_reward_guard()
+            return
+        if self._card_reward_guard_started_at is None:
+            self._card_reward_guard_started_at = time.monotonic()
+
+    def _reward_claim_was_card(self, state: dict[str, object], reward_index: object) -> bool:
+        if not isinstance(reward_index, int):
+            return False
+        rewards = state.get("rewards") if isinstance(state.get("rewards"), dict) else {}
+        items = rewards.get("items") if isinstance(rewards.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if int(item.get("index", -1)) != reward_index:
+                continue
+            return _reward_item_is_card(item)
+        return False
+
+    def _mark_card_reward_preview_attempt(
+        self,
+        previous_state: dict[str, object],
+        next_state: dict[str, object],
+        tool_name: str,
+        response: dict[str, object],
+        action_kwargs: dict[str, object],
+    ) -> None:
+        self._sync_card_reward_guard_state(previous_state)
+        if (
+            tool_name == "rewards_claim"
+            and response.get("status") != "error"
+            and self._reward_claim_was_card(previous_state, action_kwargs.get("reward_index"))
+        ):
+            self._card_reward_preview_seen = True
+        self._sync_card_reward_guard_state(next_state)
+
+    def _should_block_rewards_proceed(self, state: dict[str, object]) -> bool:
+        if not self.require_card_reward_preview_before_proceed:
+            return False
+        self._sync_card_reward_guard_state(state)
+        if str(state.get("state_type", "unknown")) != "rewards":
+            return False
+        if not self._has_pending_card_reward_claim(state):
+            return False
+        if self._card_reward_preview_seen:
+            return False
+        if self.card_reward_preview_guard_timeout_seconds <= 0.0:
+            return True
+        started_at = self._card_reward_guard_started_at
+        if started_at is None:
+            self._card_reward_guard_started_at = time.monotonic()
+            return True
+        return (time.monotonic() - started_at) < self.card_reward_preview_guard_timeout_seconds
 
     def _record_combat_action_outcome(
         self,
@@ -675,7 +768,11 @@ class STS2MuZeroEnv:
             actions[confirm_index] = BoundAction(confirm_index, "combat_confirm_selection", {}, "combat confirm")
 
         self._append_indexed_actions(actions, state.get("rewards", {}), "items", 5, "rewards_claim", "rewards_claim", "reward_index", "claim reward")
-        if isinstance(state.get("rewards"), dict) and state["rewards"].get("can_proceed"):
+        if (
+            isinstance(state.get("rewards"), dict)
+            and state["rewards"].get("can_proceed")
+            and not self._should_block_rewards_proceed(state)
+        ):
             proceed_index = action_index("proceed_to_map")
             actions[proceed_index] = BoundAction(proceed_index, "proceed_to_map", {}, "proceed to map")
 
@@ -797,6 +894,7 @@ class STS2MuZeroEnv:
             if compatibility_workaround is not None:
                 response["compatibility_workaround"] = compatibility_workaround
             next_state = self.fetch_state()
+        self._mark_card_reward_preview_attempt(state, next_state, bound.tool_name, response, bound.kwargs)
         self._record_combat_action_outcome(state, next_state, bound.tool_name, response)
         boundaries = detect_transition_boundaries(state, next_state)
         reward, reward_breakdown = self._compute_reward(state, next_state, response, bound.tool_name, boundaries)
