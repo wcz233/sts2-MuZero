@@ -20,6 +20,8 @@ from .env import (
 )
 from .muzero import MuZeroAgent, Transition
 
+COMBAT_WAIT_STATE_TYPES = COMBAT_STATE_TYPES | {"hand_select"}
+
 
 def _timestamp() -> str:
     return time.strftime("%H:%M:%S")
@@ -177,6 +179,13 @@ def _run_position(state: dict[str, object]) -> tuple[int, int]:
 
 def _is_combat_state(state: dict[str, object]) -> bool:
     return str(state.get("state_type", "unknown")) in COMBAT_STATE_TYPES
+
+
+def _no_legal_action_sleep_seconds(state: dict[str, object], args: argparse.Namespace) -> float:
+    state_type = str(state.get("state_type", "unknown"))
+    if state_type in COMBAT_WAIT_STATE_TYPES:
+        return max(0.05, min(args.menu_sleep, args.poll_interval, 0.25))
+    return args.menu_sleep
 
 
 def _is_player_combat_turn(state: dict[str, object]) -> bool:
@@ -529,6 +538,8 @@ def main() -> None:
     combat_window = _open_combat_window(state, total_steps + 1)
     turn_window = _open_turn_window(state, total_steps + 1)
     run_history: list[Transition] = []
+    last_no_legal_log_state: tuple[int, str] | None = None
+    last_no_legal_log_at = 0.0
 
     while args.max_steps <= 0 or total_steps < args.max_steps:
         if combat_window is None and _is_combat_state(state):
@@ -539,14 +550,24 @@ def main() -> None:
         legal_action_map = env.build_legal_action_map(state)
         legal_actions = sorted(legal_action_map)
         if not legal_actions:
-            print(f"[{_timestamp()}] step={total_steps} state={state.get('state_type')} no legal actions; polling", flush=True)
-            time.sleep(args.menu_sleep)
+            sleep_seconds = _no_legal_action_sleep_seconds(state, args)
+            log_state = (total_steps, str(state.get("state_type", "unknown")))
+            now = time.monotonic()
+            if log_state != last_no_legal_log_state or now - last_no_legal_log_at >= 1.0:
+                print(
+                    f"[{_timestamp()}] step={total_steps} state={state.get('state_type')} no legal actions; polling sleep={sleep_seconds:.2f}s",
+                    flush=True,
+                )
+                last_no_legal_log_state = log_state
+                last_no_legal_log_at = now
+            time.sleep(sleep_seconds)
             state = (
                 _wait_for_run(env, args.menu_sleep, args.character, args.ascension, args.manual_start)
                 if str(state.get("state_type")) in {"menu", "game_over"}
                 else env.fetch_state()
             )
             continue
+        last_no_legal_log_state = None
 
         observation = env.extract_observation_features(state)
         search = agent.plan(observation, legal_actions, use_exploration_noise=not args.no_root_noise)

@@ -47,6 +47,9 @@ class Transition:
     next_observation: list[float]
     done: bool
     policy_target: list[float]
+    raw_reward: float = 0.0
+    credit_adjustment: float = 0.0
+    turn_end: bool = False
     combat_end: bool = False
     act_end: bool = False
     run_end: bool = False
@@ -106,6 +109,7 @@ class ReplayBuffer:
     def boundary_counts(self) -> dict[str, int]:
         return {
             "total": len(self.items),
+            "turn_end": sum(1 for item in self.items if item.turn_end),
             "combat_end": sum(1 for item in self.items if item.combat_end),
             "act_end": sum(1 for item in self.items if item.act_end),
             "run_end": sum(1 for item in self.items if item.run_end),
@@ -259,14 +263,15 @@ class MuZeroAgent:
         observation_size: int,
         action_size: int,
         hidden_size: int = 64,
-        learning_rate: float = 0.01,
+        learning_rate: float = 2e-4,
         discount: float = 0.997,
-        simulations: int = 24,
-        replay_capacity: int = 4096,
-        warmup_samples: int = 32,
+        simulations: int = 40,
+        replay_capacity: int = 12000,
+        warmup_samples: int = 1000,
         seed: int = 7,
         dirichlet_alpha: float = 0.3,
         exploration_fraction: float = 0.25,
+        turn_end_sample_bonus: float = 0.0,
         combat_end_sample_bonus: float = 1.0,
         act_end_sample_bonus: float = 3.0,
         run_end_sample_bonus: float = 7.0,
@@ -278,6 +283,7 @@ class MuZeroAgent:
         self.warmup_samples = warmup_samples
         self.dirichlet_alpha = dirichlet_alpha
         self.exploration_fraction = exploration_fraction
+        self.turn_end_sample_bonus = turn_end_sample_bonus
         self.combat_end_sample_bonus = combat_end_sample_bonus
         self.act_end_sample_bonus = act_end_sample_bonus
         self.run_end_sample_bonus = run_end_sample_bonus
@@ -352,6 +358,8 @@ class MuZeroAgent:
 
     def _replay_weight(self, transition: Transition) -> float:
         weight = 1.0
+        if transition.turn_end:
+            weight += self.turn_end_sample_bonus
         if transition.combat_end:
             weight += self.combat_end_sample_bonus
         if transition.act_end:
@@ -418,6 +426,7 @@ class MuZeroAgent:
             "warmup_samples": self.warmup_samples,
             "training_steps": self.training_steps,
             "replay_weights": {
+                "turn_end_sample_bonus": self.turn_end_sample_bonus,
                 "combat_end_sample_bonus": self.combat_end_sample_bonus,
                 "act_end_sample_bonus": self.act_end_sample_bonus,
                 "run_end_sample_bonus": self.run_end_sample_bonus,
@@ -440,6 +449,7 @@ class MuZeroAgent:
         self.training_steps = int(payload.get("training_steps", self.training_steps))
         replay_weights = payload.get("replay_weights")
         if isinstance(replay_weights, dict):
+            self.turn_end_sample_bonus = float(replay_weights.get("turn_end_sample_bonus", self.turn_end_sample_bonus))
             self.combat_end_sample_bonus = float(replay_weights.get("combat_end_sample_bonus", self.combat_end_sample_bonus))
             self.act_end_sample_bonus = float(replay_weights.get("act_end_sample_bonus", self.act_end_sample_bonus))
             self.run_end_sample_bonus = float(replay_weights.get("run_end_sample_bonus", self.run_end_sample_bonus))
