@@ -1,0 +1,9 @@
+[project]
+name = "sts2-muzero"
+version = "0.1.0"
+description = "Shell-first MuZero prototype for Slay the Spire 2 via STS2MCP"
+requires-python = ">=3.11"
+
+[project.scripts]
+sts2-muzero = "sts2_muzero.cli:main"
+
