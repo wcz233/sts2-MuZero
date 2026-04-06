@@ -4,6 +4,8 @@ This directory contains a shell-first MuZero-style reinforcement learning protot
 
 It reuses the singleplayer state/action semantics from `repos/STS2MCP` and talks to the live game through the same localhost API exposed by the mod.
 
+The current version can also auto-dismiss post-run screens and start a fresh run with a preset character, so training can continue without manual menu clicks.
+
 ## Scope
 
 - singleplayer only
@@ -50,9 +52,11 @@ python run_training.py --resume
 Example flags:
 
 ```powershell
+python run_training.py --character Ironclad --ascension 0 --resume
 python run_training.py --simulations 32 --updates-per-step 4 --checkpoint-interval 25
 python run_training.py --temperature 0.25 --no-root-noise
 python run_training.py --max-steps 200
+python run_training.py --manual-start
 ```
 
 ## Example shell output

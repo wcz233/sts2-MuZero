@@ -77,6 +77,12 @@ class STS2Bridge:
     def get_game_state(self, format: str = "json") -> dict[str, object]:
         return self._request_json("GET", self._singleplayer_path, query={"format": format})
 
+    def start_run(self, character: str = "Ironclad", ascension: int | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {"character": character}
+        if ascension is not None:
+            payload["ascension"] = ascension
+        return self._post_action("start_run", **payload)
+
     def use_potion(self, slot: int, target: str | None = None) -> dict[str, object]:
         payload: dict[str, object] = {"slot": slot}
         if target is not None:

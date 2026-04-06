@@ -7,6 +7,7 @@ from .bridge import STS2Bridge
 COMBAT_STATE_TYPES = {"monster", "elite", "boss"}
 STATE_TYPES = [
     "menu",
+    "game_over",
     "unknown",
     "monster",
     "elite",
@@ -27,6 +28,7 @@ STATE_TYPES = [
     "overlay",
 ]
 ENEMY_TARGET_TYPES = {"AnyEnemy", "Enemy", "SingleEnemy"}
+TERMINAL_STATE_TYPES = {"menu", "game_over"}
 
 
 @dataclass
@@ -432,7 +434,9 @@ class STS2MuZeroEnv:
         response = self.bridge.call_tool(bound.tool_name, **bound.kwargs)
         next_state = self._poll_state(bound.tool_name)
         reward = self._compute_reward(state, next_state, response)
-        done = state.get("state_type") != "menu" and next_state.get("state_type") == "menu"
+        previous_state_type = str(state.get("state_type", "unknown"))
+        next_state_type = str(next_state.get("state_type", "unknown"))
+        done = previous_state_type not in TERMINAL_STATE_TYPES and next_state_type in TERMINAL_STATE_TYPES
         return next_state, reward, done, {"tool_name": bound.tool_name, "description": bound.description, "response": response}
 
     def _append_indexed_actions(
@@ -510,6 +514,6 @@ class STS2MuZeroEnv:
         reward += 0.10 * (previous_enemy_hp - next_enemy_hp)
         if str(previous_state.get("state_type", "")) in COMBAT_STATE_TYPES and str(next_state.get("state_type", "")) not in COMBAT_STATE_TYPES and previous_enemy_hp > 0:
             reward += 8.0
-        if previous_state.get("state_type") != "menu" and next_state.get("state_type") == "menu":
+        if str(previous_state.get("state_type", "unknown")) not in TERMINAL_STATE_TYPES and str(next_state.get("state_type", "unknown")) in TERMINAL_STATE_TYPES:
             reward += 10.0 if float(previous_player.get("hp", 0) or 0) > 0 else -10.0
         return reward
