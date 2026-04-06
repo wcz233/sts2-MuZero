@@ -3,6 +3,15 @@ from dataclasses import dataclass
 
 from .action_space import action_index
 from .bridge import STS2Bridge, STS2BridgeError
+from .semantics import (
+    CONCEPT_VOCAB_SIZE,
+    SEMANTIC_HISTORY_SIZE,
+    SEMANTIC_OBSERVATION_SIZE as SEMANTIC_VECTOR_SIZE,
+    SEMANTIC_RELATION_SIZE,
+    SEMANTIC_SCALAR_SIZE,
+    SemanticHistoryTracker,
+    encode_semantic_observation,
+)
 
 COMBAT_STATE_TYPES = {"monster", "elite", "boss"}
 STATE_TYPES = [
@@ -37,6 +46,26 @@ class BoundAction:
     tool_name: str
     kwargs: dict[str, object]
     description: str
+
+
+@dataclass
+class RewardWeights:
+    error_penalty: float = 1.0
+    floor_advance: float = 5.0
+    act_advance: float = 20.0
+    hp_delta: float = 5.0
+    gold_delta: float = 0.5
+    gold_delta_scale: float = 25.0
+    enemy_hp_delta: float = 8.0
+    turn_end: float = 0.0
+    turn_skip_unspent_penalty: float = 0.0
+    combat_end: float = 8.0
+    combat_defeat: float = -8.0
+    act_end: float = 0.0
+    run_victory: float = 10.0
+    run_defeat: float = -10.0
+    combat_tactical_shaping: float = 0.35
+    end_turn_slack_penalty: float = 0.5
 
 
 def _bool(value: object) -> float:
@@ -89,6 +118,24 @@ def _intent_damage(enemy: dict[str, object]) -> float:
     return 0.0
 
 
+def _incoming_enemy_damage(state: dict[str, object]) -> float:
+    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+    enemies = battle.get("enemies") if isinstance(battle.get("enemies"), list) else []
+    return sum(_intent_damage(enemy) for enemy in enemies if isinstance(enemy, dict) and float(enemy.get("hp", 0) or 0) > 0.0)
+
+
+def _int_prefix(text: object) -> int | None:
+    digits = []
+    for character in str(text):
+        if character.isdigit():
+            digits.append(character)
+        elif digits:
+            break
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
 def _push_state_type(features: list[float], state_type: str) -> None:
     for candidate in STATE_TYPES:
         features.append(1.0 if candidate == state_type else 0.0)
@@ -99,17 +146,107 @@ def _total_enemy_hp(state: dict[str, object]) -> float:
     return sum(float(enemy.get("hp", 0) or 0) for enemy in battle.get("enemies", []) if isinstance(enemy, dict))
 
 
+def _total_enemy_max_hp(state: dict[str, object]) -> float:
+    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+    total = 0.0
+    for enemy in battle.get("enemies", []):
+        if not isinstance(enemy, dict):
+            continue
+        hp = float(enemy.get("hp", 0) or 0)
+        if hp <= 0.0:
+            continue
+        total += max(float(enemy.get("max_hp", 0) or 0), hp, 1.0)
+    return total
+
+
+def _player_hp(state: dict[str, object]) -> float:
+    player = state.get("player") if isinstance(state.get("player"), dict) else {}
+    return float(player.get("hp", 0) or 0)
+
+
+def _combat_player(state: dict[str, object]) -> dict[str, object]:
+    player = state.get("player")
+    return player if isinstance(player, dict) else {}
+
+
+def _count_playable_cards(state: dict[str, object]) -> int:
+    player = _combat_player(state)
+    hand_cards = player.get("hand", []) if isinstance(player.get("hand"), list) else []
+    return sum(
+        1
+        for card in hand_cards
+        if isinstance(card, dict) and card.get("can_play") and isinstance(card.get("index"), int) and int(card["index"]) <= 9
+    )
+
+
+def _unspent_energy_units(state: dict[str, object]) -> int:
+    player = _combat_player(state)
+    energy = max(0.0, float(player.get("energy", 0) or 0))
+    return max(0, int(energy))
+
+
+def _potion_capacity(player: dict[str, object]) -> int:
+    for key in ("max_potions", "potion_slots", "max_potion_slots", "max_potion_capacity"):
+        value = player.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            return max(1, int(value))
+    potions = player.get("potions", []) if isinstance(player.get("potions"), list) else []
+    highest_slot = max((int(potion.get("slot", -1)) for potion in potions if isinstance(potion, dict) and isinstance(potion.get("slot"), int)), default=-1)
+    return max(3, len(potions), highest_slot + 1)
+
+
+def _potion_slots_filled(player: dict[str, object]) -> bool:
+    potions = player.get("potions", []) if isinstance(player.get("potions"), list) else []
+    occupied_slots = {
+        int(potion["slot"])
+        for potion in potions
+        if isinstance(potion, dict) and isinstance(potion.get("slot"), int)
+    }
+    occupied_count = len(occupied_slots) if occupied_slots else len(potions)
+    return occupied_count >= _potion_capacity(player)
+
+
+def _reward_item_is_potion(item: dict[str, object]) -> bool:
+    if isinstance(item.get("potion"), dict):
+        return True
+    for key in ("type", "category", "reward_type", "item_type", "kind", "name", "label"):
+        token = str(item.get(key, "")).lower()
+        if "potion" in token:
+            return True
+    return False
+
+
+def _has_pending_potion_reward(state: dict[str, object]) -> bool:
+    rewards = state.get("rewards") if isinstance(state.get("rewards"), dict) else {}
+    items = rewards.get("items") if isinstance(rewards.get("items"), list) else []
+    return any(isinstance(item, dict) and _reward_item_is_potion(item) for item in items)
+
+
 def detect_transition_boundaries(previous_state: dict[str, object], next_state: dict[str, object]) -> dict[str, object]:
     previous_state_type = str(previous_state.get("state_type", "unknown"))
     next_state_type = str(next_state.get("state_type", "unknown"))
     previous_run = previous_state.get("run") if isinstance(previous_state.get("run"), dict) else {}
     next_run = next_state.get("run") if isinstance(next_state.get("run"), dict) else {}
+    previous_battle = previous_state.get("battle") if isinstance(previous_state.get("battle"), dict) else {}
+    next_battle = next_state.get("battle") if isinstance(next_state.get("battle"), dict) else {}
     previous_act = int(previous_run.get("act", 0) or 0)
     next_act = int(next_run.get("act", 0) or 0)
     previous_floor = int(previous_run.get("floor", 0) or 0)
     next_floor = int(next_run.get("floor", 0) or 0)
     previous_enemy_hp = _total_enemy_hp(previous_state)
     next_enemy_hp = _total_enemy_hp(next_state)
+    previous_round = int(previous_battle.get("round", 0) or 0)
+    next_round = int(next_battle.get("round", 0) or 0)
+    previous_turn = str(previous_battle.get("turn", ""))
+    next_turn = str(next_battle.get("turn", ""))
+    turn_end = (
+        previous_state_type in COMBAT_STATE_TYPES
+        and previous_turn == "player"
+        and (
+            next_state_type not in COMBAT_STATE_TYPES
+            or (next_state_type in COMBAT_STATE_TYPES and next_turn == "player" and next_round > previous_round)
+        )
+    )
     combat_end = previous_state_type in COMBAT_STATE_TYPES and next_state_type not in COMBAT_STATE_TYPES and previous_enemy_hp > 0.0
     act_end = next_act > previous_act
     run_end = previous_state_type not in TERMINAL_STATE_TYPES and next_state_type in TERMINAL_STATE_TYPES
@@ -122,13 +259,14 @@ def detect_transition_boundaries(previous_state: dict[str, object], next_state: 
         "next_floor": next_floor,
         "previous_enemy_hp": previous_enemy_hp,
         "next_enemy_hp": next_enemy_hp,
+        "turn_end": turn_end,
         "combat_end": combat_end,
         "act_end": act_end,
         "run_end": run_end,
     }
 
 
-def extract_observation_features(state: dict[str, object]) -> list[float]:
+def _extract_base_observation_features(state: dict[str, object]) -> list[float]:
     state_type = str(state.get("state_type", "unknown"))
     run = state.get("run") if isinstance(state.get("run"), dict) else {}
     player = state.get("player") if isinstance(state.get("player"), dict) else {}
@@ -272,18 +410,52 @@ def extract_observation_features(state: dict[str, object]) -> list[float]:
     return features
 
 
-OBSERVATION_SIZE = len(extract_observation_features({"state_type": "menu"}))
+def extract_observation_features(state: dict[str, object]) -> list[float]:
+    features = _extract_base_observation_features(state)
+    features.extend(encode_semantic_observation(state).vector)
+    return features
+
+
+BASE_OBSERVATION_SIZE = len(_extract_base_observation_features({"state_type": "menu"}))
+SEMANTIC_CONCEPT_SIZE = CONCEPT_VOCAB_SIZE
+SEMANTIC_OBSERVATION_SIZE = SEMANTIC_VECTOR_SIZE
+OBSERVATION_SIZE = BASE_OBSERVATION_SIZE + SEMANTIC_OBSERVATION_SIZE
 
 
 class STS2MuZeroEnv:
-    def __init__(self, bridge: STS2Bridge, poll_interval: float = 0.15, max_poll_attempts: int = 20) -> None:
+    def __init__(
+        self,
+        bridge: STS2Bridge,
+        poll_interval: float = 0.15,
+        max_poll_attempts: int = 20,
+        reward_discount: float = 0.997,
+        reward_weights: RewardWeights | None = None,
+        card_select_candidate_limit: int = 6,
+        block_premature_end_turn: bool = True,
+        end_turn_guard_stall_limit: int = 3,
+        end_turn_guard_timeout_seconds: float = 3.0,
+    ) -> None:
         self.bridge = bridge
         self.poll_interval = poll_interval
         self.max_poll_attempts = max_poll_attempts
+        self.reward_discount = reward_discount
+        self.reward_weights = reward_weights or RewardWeights()
+        self.card_select_candidate_limit = max(0, int(card_select_candidate_limit))
+        self.block_premature_end_turn = block_premature_end_turn
+        self.end_turn_guard_stall_limit = max(1, int(end_turn_guard_stall_limit))
+        self.end_turn_guard_timeout_seconds = max(0.0, float(end_turn_guard_timeout_seconds))
         self._disable_play_card_above_ten = False
+        self._combat_stall_counts: dict[tuple[object, ...], int] = {}
+        self._combat_end_turn_guard_started_at: dict[tuple[object, ...], float] = {}
+        self.semantic_history = SemanticHistoryTracker()
 
     def fetch_state(self) -> dict[str, object]:
         return self.bridge.get_game_state(format="json")
+
+    def extract_observation_features(self, state: dict[str, object]) -> list[float]:
+        features = _extract_base_observation_features(state)
+        features.extend(encode_semantic_observation(state, history=self.semantic_history).vector)
+        return features
 
     def _is_combat_action_window_ready(self, state: dict[str, object]) -> bool:
         if str(state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
@@ -349,6 +521,64 @@ class STS2MuZeroEnv:
             bool(hand_select.get("can_confirm")),
         )
 
+    def _combat_has_living_enemies(self, state: dict[str, object]) -> bool:
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        return any(isinstance(enemy, dict) and float(enemy.get("hp", 0) or 0) > 0.0 for enemy in battle.get("enemies", []))
+
+    def _stall_count(self, state: dict[str, object]) -> int:
+        return self._combat_stall_counts.get(self._combat_progress_signature(state), 0)
+
+    def _clear_combat_guard_state(self, signature: tuple[object, ...]) -> None:
+        self._combat_stall_counts.pop(signature, None)
+        self._combat_end_turn_guard_started_at.pop(signature, None)
+
+    def _record_combat_action_outcome(
+        self,
+        previous_state: dict[str, object],
+        next_state: dict[str, object],
+        tool_name: str,
+        response: dict[str, object],
+    ) -> None:
+        if str(previous_state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return
+        previous_signature = self._combat_progress_signature(previous_state)
+        if str(next_state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            self._clear_combat_guard_state(previous_signature)
+            return
+        next_signature = self._combat_progress_signature(next_state)
+        if tool_name == "combat_end_turn" or previous_signature != next_signature:
+            self._clear_combat_guard_state(previous_signature)
+            return
+        if tool_name not in {"combat_play_card", "use_potion", "discard_potion", "combat_select_card", "combat_confirm_selection"}:
+            return
+        if response.get("status") == "error" or previous_signature == next_signature:
+            self._combat_stall_counts[previous_signature] = self._combat_stall_counts.get(previous_signature, 0) + 1
+        else:
+            self._clear_combat_guard_state(previous_signature)
+
+    def _should_block_combat_end_turn(self, state: dict[str, object], actions: dict[int, BoundAction]) -> bool:
+        if not self.block_premature_end_turn:
+            return False
+        if not self._is_combat_action_window_ready(state):
+            return False
+        if not self._combat_has_living_enemies(state):
+            return False
+        if not any(bound.tool_name == "combat_play_card" for bound in actions.values()):
+            return False
+        signature = self._combat_progress_signature(state)
+        if self.end_turn_guard_timeout_seconds > 0.0:
+            started_at = self._combat_end_turn_guard_started_at.get(signature)
+            if started_at is None:
+                self._combat_end_turn_guard_started_at[signature] = time.monotonic()
+                return True
+            return (time.monotonic() - started_at) < self.end_turn_guard_timeout_seconds
+        if self._stall_count(state) >= self.end_turn_guard_stall_limit:
+            return False
+        return True
+
+    def _can_discard_potion(self, state: dict[str, object], player: dict[str, object]) -> bool:
+        return _potion_slots_filled(player) and _has_pending_potion_reward(state)
+
     def build_legal_action_map(self, state: dict[str, object]) -> dict[int, BoundAction]:
         actions: dict[int, BoundAction] = {}
         state_type = str(state.get("state_type", "unknown"))
@@ -386,16 +616,19 @@ class STS2MuZeroEnv:
                     elif not _is_enemy_target(card.get("target_type")):
                         index = action_index("combat_play_card", card_index, -1)
                         actions[index] = BoundAction(index, "combat_play_card", {"card_index": card_index}, f"play {card_name}")
-            end_turn_index = action_index("combat_end_turn")
-            actions[end_turn_index] = BoundAction(end_turn_index, "combat_end_turn", {}, "end turn")
+            if not self._should_block_combat_end_turn(state, actions):
+                end_turn_index = action_index("combat_end_turn")
+                actions[end_turn_index] = BoundAction(end_turn_index, "combat_end_turn", {}, "end turn")
 
-        if state_type not in {"menu", "unknown", "overlay"}:
+        potions = player.get("potions", []) if isinstance(player.get("potions"), list) else []
+        can_discard_potion = self._can_discard_potion(state, player)
+
+        if self._is_combat_action_window_ready(state):
             enemies = [
                 enemy
                 for enemy in battle.get("enemies", [])
                 if isinstance(enemy, dict) and float(enemy.get("hp", 0) or 0) > 0
             ]
-            potions = player.get("potions", []) if isinstance(player.get("potions"), list) else []
             for potion in potions:
                 if not isinstance(potion, dict):
                     continue
@@ -415,6 +648,15 @@ class STS2MuZeroEnv:
                 else:
                     index = action_index("use_potion", slot, -1)
                     actions[index] = BoundAction(index, "use_potion", {"slot": slot}, f"use {potion_name}")
+
+        if can_discard_potion:
+            for potion in potions:
+                if not isinstance(potion, dict):
+                    continue
+                slot = potion.get("slot")
+                if not isinstance(slot, int) or slot > 2:
+                    continue
+                potion_name = str(potion.get("name", f"potion_{slot}"))
                 discard_index = action_index("discard_potion", slot, None)
                 actions[discard_index] = BoundAction(discard_index, "discard_potion", {"slot": slot}, f"discard {potion_name}")
 
@@ -492,19 +734,24 @@ class STS2MuZeroEnv:
             proceed_index = action_index("proceed_to_map")
             actions[proceed_index] = BoundAction(proceed_index, "proceed_to_map", {}, "leave treasure")
 
-        self._append_indexed_actions(actions, state.get("card_select", {}), "cards", 20, "deck_select_card", "deck_select_card", "card_index", "deck select")
-        if isinstance(state.get("card_select"), dict) and state["card_select"].get("can_confirm"):
+        card_select_state = state.get("card_select", {}) if isinstance(state.get("card_select"), dict) else {}
+        card_select_preview = bool(card_select_state.get("preview_showing")) if isinstance(card_select_state, dict) else False
+        if not card_select_preview:
+            self._append_card_select_actions(actions, card_select_state)
+        if isinstance(card_select_state, dict) and card_select_state.get("can_confirm"):
             confirm_index = action_index("deck_confirm_selection")
             actions[confirm_index] = BoundAction(confirm_index, "deck_confirm_selection", {}, "deck confirm")
-        if isinstance(state.get("card_select"), dict) and (state["card_select"].get("can_cancel") or state["card_select"].get("can_skip")):
+        if isinstance(card_select_state, dict) and (card_select_state.get("can_cancel") or card_select_state.get("can_skip")):
             cancel_index = action_index("deck_cancel_selection")
             actions[cancel_index] = BoundAction(cancel_index, "deck_cancel_selection", {}, "deck cancel")
 
-        self._append_indexed_actions(actions, state.get("bundle_select", {}), "bundles", 3, "bundle_select", "bundle_select", "bundle_index", "bundle select")
-        if isinstance(state.get("bundle_select"), dict) and state["bundle_select"].get("can_confirm"):
+        bundle_select_state = state.get("bundle_select", {}) if isinstance(state.get("bundle_select"), dict) else {}
+        if not (isinstance(bundle_select_state, dict) and bundle_select_state.get("preview_showing")):
+            self._append_indexed_actions(actions, bundle_select_state, "bundles", 3, "bundle_select", "bundle_select", "bundle_index", "bundle select")
+        if isinstance(bundle_select_state, dict) and bundle_select_state.get("can_confirm"):
             confirm_index = action_index("bundle_confirm_selection")
             actions[confirm_index] = BoundAction(confirm_index, "bundle_confirm_selection", {}, "bundle confirm")
-        if isinstance(state.get("bundle_select"), dict) and state["bundle_select"].get("can_cancel"):
+        if isinstance(bundle_select_state, dict) and bundle_select_state.get("can_cancel"):
             cancel_index = action_index("bundle_cancel_selection")
             actions[cancel_index] = BoundAction(cancel_index, "bundle_cancel_selection", {}, "bundle cancel")
 
@@ -550,10 +797,25 @@ class STS2MuZeroEnv:
             if compatibility_workaround is not None:
                 response["compatibility_workaround"] = compatibility_workaround
             next_state = self.fetch_state()
+        self._record_combat_action_outcome(state, next_state, bound.tool_name, response)
         boundaries = detect_transition_boundaries(state, next_state)
-        reward = self._compute_reward(state, next_state, response, boundaries)
+        reward, reward_breakdown = self._compute_reward(state, next_state, response, bound.tool_name, boundaries)
+        self.semantic_history.update_from_transition(
+            state,
+            next_state,
+            bound.tool_name,
+            response,
+            boundaries,
+            action_kwargs=bound.kwargs,
+        )
         done = bool(boundaries["run_end"])
-        return next_state, reward, done, {"tool_name": bound.tool_name, "description": bound.description, "response": response, **boundaries}
+        return next_state, reward, done, {
+            "tool_name": bound.tool_name,
+            "description": bound.description,
+            "response": response,
+            "reward_breakdown": reward_breakdown,
+            **boundaries,
+        }
 
     def _append_indexed_actions(
         self,
@@ -579,6 +841,90 @@ class STS2MuZeroEnv:
                 continue
             index = action_index(lookup_kind, item_index, None)
             actions[index] = BoundAction(index, tool_name, {argument_name: item_index}, f"{label_prefix} {item_index}")
+
+    def _append_card_select_actions(self, actions: dict[int, BoundAction], card_select_state: object) -> None:
+        if not isinstance(card_select_state, dict):
+            return
+        items = card_select_state.get("cards")
+        if not isinstance(items, list):
+            return
+        allowed_indices = self._filtered_card_select_indices(card_select_state)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_index = item.get("index")
+            if not isinstance(item_index, int) or item_index >= 20 or item_index not in allowed_indices:
+                continue
+            index = action_index("deck_select_card", item_index, None)
+            label = str(item.get("name", item_index))
+            actions[index] = BoundAction(index, "deck_select_card", {"card_index": item_index}, f"deck select {label}")
+
+    def _filtered_card_select_indices(self, card_select_state: dict[str, object]) -> set[int]:
+        cards = card_select_state.get("cards")
+        if not isinstance(cards, list):
+            return set()
+        available_indices = {
+            int(card["index"])
+            for card in cards
+            if isinstance(card, dict) and isinstance(card.get("index"), int) and int(card["index"]) < 20
+        }
+        if not available_indices:
+            return set()
+        if not self._is_upgrade_like_card_select(card_select_state) or self.card_select_candidate_limit <= 0:
+            return available_indices
+        candidate_count = max(1, self._required_card_select_count(card_select_state))
+        shortlist_size = max(candidate_count, self.card_select_candidate_limit)
+        ranked_cards = sorted(
+            (
+                card
+                for card in cards
+                if isinstance(card, dict) and isinstance(card.get("index"), int) and int(card["index"]) in available_indices
+            ),
+            key=self._score_card_select_candidate,
+            reverse=True,
+        )
+        return {int(card["index"]) for card in ranked_cards[:shortlist_size]}
+
+    def _is_upgrade_like_card_select(self, card_select_state: dict[str, object]) -> bool:
+        screen_type = str(card_select_state.get("screen_type", "")).lower()
+        prompt = str(card_select_state.get("prompt", "")).lower()
+        return any(token in screen_type for token in ("upgrade", "enchant")) or any(token in prompt for token in ("upgrade", "enchant", "imbue"))
+
+    def _required_card_select_count(self, card_select_state: dict[str, object]) -> int:
+        prompt = str(card_select_state.get("prompt", ""))
+        value = _int_prefix(prompt)
+        return value if value is not None and value > 0 else 1
+
+    def _score_card_select_candidate(self, card: dict[str, object]) -> tuple[float, float, float, int]:
+        card_type = str(card.get("type", ""))
+        rarity = str(card.get("rarity", ""))
+        is_upgraded = bool(card.get("is_upgraded"))
+        raw_cost = card.get("cost")
+        cost_value = 0.0
+        if raw_cost == "X":
+            cost_value = 1.5
+        else:
+            try:
+                cost_value = float(raw_cost)
+            except (TypeError, ValueError):
+                cost_value = 0.0
+        type_score = {
+            "Power": 2.4,
+            "Attack": 2.0,
+            "Skill": 1.8,
+            "Status": -3.0,
+            "Curse": -4.0,
+        }.get(card_type, 0.0)
+        rarity_score = {
+            "Rare": 1.3,
+            "Uncommon": 0.8,
+            "Common": 0.4,
+            "Starter": 0.1,
+            "Basic": 0.1,
+        }.get(rarity, 0.0)
+        upgrade_score = -5.0 if is_upgraded else 3.5
+        index = int(card.get("index", 0) or 0)
+        return (upgrade_score + type_score + rarity_score + min(2.0, cost_value * 0.35), rarity_score, cost_value, -index)
 
     def _extract_shop_state(self, state: dict[str, object]) -> dict[str, object]:
         state_type = str(state.get("state_type", "unknown"))
@@ -626,24 +972,179 @@ class STS2MuZeroEnv:
         previous_state: dict[str, object],
         next_state: dict[str, object],
         response: dict[str, object],
+        tool_name: str,
         boundaries: dict[str, object] | None = None,
-    ) -> float:
+    ) -> tuple[float, dict[str, float]]:
         if boundaries is None:
             boundaries = detect_transition_boundaries(previous_state, next_state)
-        reward = -1.0 if response.get("status") == "error" else 0.0
+        breakdown: dict[str, float] = {}
+        reward = 0.0
+
+        if response.get("status") == "error":
+            breakdown["error_penalty"] = -abs(self.reward_weights.error_penalty)
+            reward += breakdown["error_penalty"]
+
         previous_run = previous_state.get("run") if isinstance(previous_state.get("run"), dict) else {}
         next_run = next_state.get("run") if isinstance(next_state.get("run"), dict) else {}
-        reward += 5.0 * max(0, int(next_run.get("floor", 0) or 0) - int(previous_run.get("floor", 0) or 0))
-        reward += 20.0 * max(0, int(next_run.get("act", 0) or 0) - int(previous_run.get("act", 0) or 0))
+        floor_delta = max(0, int(next_run.get("floor", 0) or 0) - int(previous_run.get("floor", 0) or 0))
+        act_delta = max(0, int(next_run.get("act", 0) or 0) - int(previous_run.get("act", 0) or 0))
+        if floor_delta > 0:
+            breakdown["floor_advance"] = self.reward_weights.floor_advance * floor_delta
+            reward += breakdown["floor_advance"]
+        if act_delta > 0:
+            breakdown["act_advance"] = self.reward_weights.act_advance * act_delta
+            reward += breakdown["act_advance"]
+
         previous_player = previous_state.get("player") if isinstance(previous_state.get("player"), dict) else {}
         next_player = next_state.get("player") if isinstance(next_state.get("player"), dict) else {}
-        reward += 0.20 * (float(next_player.get("hp", 0) or 0) - float(previous_player.get("hp", 0) or 0))
-        reward += 0.02 * (float(next_player.get("gold", 0) or 0) - float(previous_player.get("gold", 0) or 0))
+        hp_delta = float(next_player.get("hp", 0) or 0) - float(previous_player.get("hp", 0) or 0)
+        gold_delta = float(next_player.get("gold", 0) or 0) - float(previous_player.get("gold", 0) or 0)
+        player_max_hp = max(float(previous_player.get("max_hp", 0) or next_player.get("max_hp", 0) or 0), 1.0)
+        if hp_delta != 0.0:
+            breakdown["hp_delta"] = self.reward_weights.hp_delta * (hp_delta / player_max_hp)
+            reward += breakdown["hp_delta"]
+        if gold_delta != 0.0:
+            gold_scale = max(self.reward_weights.gold_delta_scale, 1.0)
+            breakdown["gold_delta"] = self.reward_weights.gold_delta * (gold_delta / gold_scale)
+            reward += breakdown["gold_delta"]
+
+        player_survived = self._combat_player_survived(previous_state, next_state)
         previous_enemy_hp = float(boundaries["previous_enemy_hp"])
-        next_enemy_hp = float(boundaries["next_enemy_hp"])
-        reward += 0.10 * (previous_enemy_hp - next_enemy_hp)
+        next_enemy_hp = float(boundaries["next_enemy_hp"]) if player_survived or not boundaries["combat_end"] else previous_enemy_hp
+        enemy_hp_delta = previous_enemy_hp - next_enemy_hp
+        previous_enemy_max_hp = max(_total_enemy_max_hp(previous_state), previous_enemy_hp, 1.0)
+        if enemy_hp_delta != 0.0:
+            breakdown["enemy_hp_delta"] = self.reward_weights.enemy_hp_delta * (enemy_hp_delta / previous_enemy_max_hp)
+            reward += breakdown["enemy_hp_delta"]
+
+        tactical_delta = self._combat_tactical_delta(previous_state, next_state)
+        if tactical_delta != 0.0:
+            breakdown["combat_tactical"] = tactical_delta
+            reward += tactical_delta
+
+        turn_skip_unspent_penalty, turn_skip_unspent_energy = self._turn_skip_unspent_penalty(
+            previous_state,
+            tool_name,
+            boundaries,
+            player_survived,
+        )
+        end_turn_slack = 0.0 if turn_skip_unspent_penalty > 0.0 else self._combat_end_turn_slack(previous_state, next_state, tool_name, boundaries)
+        if end_turn_slack != 0.0:
+            breakdown["end_turn_slack"] = -end_turn_slack
+            reward -= end_turn_slack
+
+        if boundaries["turn_end"] and self.reward_weights.turn_end != 0.0 and turn_skip_unspent_penalty <= 0.0:
+            breakdown["turn_end"] = self.reward_weights.turn_end
+            reward += breakdown["turn_end"]
+        if turn_skip_unspent_penalty != 0.0:
+            breakdown["turn_skip_unspent"] = -turn_skip_unspent_penalty
+            breakdown["turn_skip_unspent_energy"] = float(turn_skip_unspent_energy)
+            reward -= turn_skip_unspent_penalty
         if boundaries["combat_end"]:
-            reward += 8.0
+            combat_weight = self.reward_weights.combat_end if player_survived else self.reward_weights.combat_defeat
+            breakdown["combat_end"] = combat_weight
+            reward += combat_weight
+        if boundaries["act_end"] and self.reward_weights.act_end != 0.0:
+            breakdown["act_end"] = self.reward_weights.act_end
+            reward += breakdown["act_end"]
         if boundaries["run_end"]:
-            reward += 10.0 if float(previous_player.get("hp", 0) or 0) > 0 else -10.0
-        return reward
+            run_weight = self.reward_weights.run_victory if player_survived else self.reward_weights.run_defeat
+            breakdown["run_end"] = run_weight
+            reward += run_weight
+        breakdown["total"] = reward
+        return reward, breakdown
+
+    def _combat_player_survived(self, previous_state: dict[str, object], next_state: dict[str, object]) -> bool:
+        next_hp = _player_hp(next_state)
+        if next_hp > 0.0:
+            return True
+        if str(next_state.get("state_type", "unknown")) == "menu":
+            return _player_hp(previous_state) > 0.0
+        return False
+
+    def _turn_skip_unspent_penalty(
+        self,
+        previous_state: dict[str, object],
+        tool_name: str,
+        boundaries: dict[str, object],
+        player_survived: bool,
+    ) -> tuple[float, int]:
+        if tool_name != "combat_end_turn" or not boundaries["turn_end"]:
+            return 0.0, 0
+        if str(previous_state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return 0.0, 0
+        if boundaries["combat_end"] and player_survived:
+            return 0.0, 0
+        lost_energy = _unspent_energy_units(previous_state)
+        if lost_energy <= 0:
+            return 0.0, 0
+        if _count_playable_cards(previous_state) <= 0:
+            return 0.0, 0
+        configured = self.reward_weights.turn_skip_unspent_penalty
+        if configured > 0.0:
+            return configured * lost_energy, lost_energy
+        fallback = max(0.0, self.reward_weights.turn_end)
+        return fallback * lost_energy, lost_energy
+
+    def _combat_tactical_delta(self, previous_state: dict[str, object], next_state: dict[str, object]) -> float:
+        if self.reward_weights.combat_tactical_shaping <= 0.0 or str(previous_state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return 0.0
+        previous_value = self._combat_tactical_potential(previous_state)
+        next_value = self._combat_tactical_potential(next_state) if str(next_state.get("state_type", "unknown")) in COMBAT_STATE_TYPES else 0.0
+        return self.reward_weights.combat_tactical_shaping * ((self.reward_discount * next_value) - previous_value)
+
+    def _combat_tactical_potential(self, state: dict[str, object]) -> float:
+        if str(state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return 0.0
+        player = state.get("player") if isinstance(state.get("player"), dict) else {}
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        enemies = battle.get("enemies") if isinstance(battle.get("enemies"), list) else []
+        max_hp = max(float(player.get("max_hp", 0) or 0), 1.0)
+        hp_ratio = _safe_div(player.get("hp"), max_hp)
+        block = float(player.get("block", 0) or 0)
+        incoming_damage = _incoming_enemy_damage(state)
+        block_coverage = min(block, incoming_damage) / max(incoming_damage, 1.0) if incoming_damage > 0.0 else 0.0
+        unblocked_pressure = min(1.0, max(0.0, incoming_damage - block) / max_hp)
+        normalized_enemy_hp = 0.0
+        for enemy in enemies:
+            if not isinstance(enemy, dict):
+                continue
+            enemy_hp = float(enemy.get("hp", 0) or 0)
+            enemy_max_hp = max(float(enemy.get("max_hp", 0) or 0), 1.0)
+            if enemy_hp <= 0.0:
+                continue
+            normalized_enemy_hp += min(1.0, enemy_hp / enemy_max_hp)
+        normalized_enemy_hp = min(1.0, normalized_enemy_hp / 3.0)
+        return (0.80 * hp_ratio) + (0.35 * block_coverage) - (0.65 * normalized_enemy_hp) - (0.45 * unblocked_pressure)
+
+    def _combat_end_turn_slack(
+        self,
+        previous_state: dict[str, object],
+        next_state: dict[str, object],
+        tool_name: str,
+        boundaries: dict[str, object],
+    ) -> float:
+        if self.reward_weights.end_turn_slack_penalty <= 0.0 or tool_name != "combat_end_turn" or boundaries["combat_end"]:
+            return 0.0
+        if str(previous_state.get("state_type", "unknown")) not in COMBAT_STATE_TYPES:
+            return 0.0
+        player = previous_state.get("player") if isinstance(previous_state.get("player"), dict) else {}
+        hand_cards = player.get("hand", []) if isinstance(player.get("hand"), list) else []
+        playable_cards = _count_playable_cards(previous_state)
+        if playable_cards <= 0:
+            return 0.0
+        energy = max(0.0, float(player.get("energy", 0) or 0))
+        max_energy = max(float(player.get("max_energy", 0) or 0), 1.0)
+        if energy <= 0.0:
+            return 0.0
+        hand_size = max(1, len(hand_cards))
+        incoming_damage = _incoming_enemy_damage(previous_state)
+        block = float(player.get("block", 0) or 0)
+        max_hp = max(float(player.get("max_hp", 0) or 0), 1.0)
+        danger_ratio = min(1.0, max(0.0, incoming_damage - block) / max_hp)
+        playable_ratio = min(1.0, playable_cards / hand_size)
+        energy_ratio = min(1.0, energy / max_energy)
+        enemy_progress = max(0.0, _total_enemy_hp(previous_state) - _total_enemy_hp(next_state))
+        progress_relief = min(0.5, enemy_progress / 20.0)
+        slack = (0.55 * energy_ratio) + (0.25 * playable_ratio) + (0.60 * danger_ratio) - progress_relief
+        return self.reward_weights.end_turn_slack_penalty * max(0.0, slack)

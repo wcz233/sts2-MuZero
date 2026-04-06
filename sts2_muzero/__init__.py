@@ -1,7 +1,17 @@
 """MuZero prototype for Slay the Spire 2."""
 
 from .action_space import ACTION_SPACE_SIZE
-from .env import OBSERVATION_SIZE
+from .env import (
+    BASE_OBSERVATION_SIZE,
+    OBSERVATION_SIZE,
+    SEMANTIC_CONCEPT_SIZE,
+    SEMANTIC_OBSERVATION_SIZE,
+)
 
-__all__ = ["ACTION_SPACE_SIZE", "OBSERVATION_SIZE"]
-
+__all__ = [
+    "ACTION_SPACE_SIZE",
+    "OBSERVATION_SIZE",
+    "BASE_OBSERVATION_SIZE",
+    "SEMANTIC_CONCEPT_SIZE",
+    "SEMANTIC_OBSERVATION_SIZE",
+]
