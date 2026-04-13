@@ -4,6 +4,8 @@ This directory contains a shell-first MuZero-style reinforcement learning protot
 
 It reuses the singleplayer state/action semantics from `repos/STS2MCP` and talks to the live game through the same localhost API exposed by the mod.
 
+This MuZero prototype is expected to run against the forked and locally modified `STS2MCP` repository at `https://github.com/wcz233/STS2MCP.git`. The stock upstream `STS2MCP` repository is not enough by itself, because this project relies on extra fork-side API/state extensions and behavior fixes that were added specifically to support the MuZero training loop.
+
 The current version can also auto-dismiss post-run screens and start a fresh run with a preset character, so training can continue without manual menu clicks.
 
 ## Scope
@@ -41,7 +43,8 @@ The current version can also auto-dismiss post-run screens and start a fresh run
 
 ## Run
 
-1. Install and enable the STS2MCP mod in Slay the Spire 2.
+1. Install and enable the forked `STS2MCP` mod from `https://github.com/wcz233/STS2MCP.git` in Slay the Spire 2.
+   The upstream/original `STS2MCP` repository may build and run, but it does not guarantee the extra interfaces and fixes that this MuZero project expects.
 2. Start the game.
 3. Start or continue a singleplayer run.
 4. Run:
