@@ -5,4 +5,5 @@ __pycache__/
 .venv/
 checkpoints/
 runs/
-
+episode_logs/
+todo/
