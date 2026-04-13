@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,8 @@ class Transition:
     next_observation: list[float]
     done: bool
     policy_target: list[float]
+    strength_target: list[float] | None = None
+    strength_mask: list[float] | None = None
     raw_reward: float = 0.0
     credit_adjustment: float = 0.0
     turn_end: bool = False
@@ -69,6 +72,7 @@ class TrainMetrics:
     reward_loss: float = 0.0
     policy_loss: float = 0.0
     consistency_loss: float = 0.0
+    strength_loss: float = 0.0
 
 
 class ReplayBuffer:
@@ -185,23 +189,26 @@ class TanhLinearLayer(LinearLayer):
 
 
 class MuZeroNetwork:
-    def __init__(self, observation_size: int, action_size: int, hidden_size: int, seed: int) -> None:
+    def __init__(self, observation_size: int, action_size: int, hidden_size: int, seed: int, strength_target_size: int = 0) -> None:
         rng = random.Random(seed)
         self.observation_size = observation_size
         self.action_size = action_size
         self.hidden_size = hidden_size
+        self.strength_target_size = max(0, int(strength_target_size))
         self.representation = TanhLinearLayer(rng, observation_size, hidden_size)
         self.dynamics = TanhLinearLayer(rng, hidden_size + action_size, hidden_size)
         self.reward_head = LinearLayer(rng, hidden_size, 1)
         self.policy_head = LinearLayer(rng, hidden_size, action_size)
         self.value_head = LinearLayer(rng, hidden_size, 1)
+        self.strength_head = LinearLayer(rng, hidden_size, self.strength_target_size) if self.strength_target_size > 0 else None
 
     def represent(self, observation: list[float], cache: bool = False) -> tuple[list[float], dict[str, object] | None]:
         hidden, outputs = self.representation.forward(observation)
         return hidden, {"observation": observation, "outputs": outputs} if cache else None
 
-    def predict(self, hidden: list[float]) -> tuple[list[float], float]:
-        return self.policy_head.forward(hidden), self.value_head.forward(hidden)[0]
+    def predict(self, hidden: list[float]) -> tuple[list[float], float, list[float]]:
+        strength_prediction = self.strength_head.forward(hidden) if self.strength_head is not None else []
+        return self.policy_head.forward(hidden), self.value_head.forward(hidden)[0], strength_prediction
 
     def transition(self, hidden: list[float], action_index: int, cache: bool = False) -> tuple[list[float], float, dict[str, object] | None]:
         action_vector = [0.0 for _ in range(self.action_size)]
@@ -213,10 +220,21 @@ class MuZeroNetwork:
             return next_hidden, reward, None
         return next_hidden, reward, {"dynamics_input": dynamics_input, "outputs": outputs, "next_hidden": next_hidden}
 
-    def backward_prediction(self, hidden: list[float], grad_logits: list[float], grad_value: float, learning_rate: float) -> list[float]:
+    def backward_prediction(
+        self,
+        hidden: list[float],
+        grad_logits: list[float],
+        grad_value: float,
+        grad_strength: list[float],
+        learning_rate: float,
+    ) -> list[float]:
         grad_from_policy = self.policy_head.backward(hidden, grad_logits, learning_rate)
         grad_from_value = self.value_head.backward(hidden, [grad_value], learning_rate)
-        return [left + right for left, right in zip(grad_from_policy, grad_from_value)]
+        grad_total = [left + right for left, right in zip(grad_from_policy, grad_from_value)]
+        if self.strength_head is not None and len(grad_strength) == self.strength_target_size:
+            grad_from_strength = self.strength_head.backward(hidden, grad_strength, learning_rate)
+            grad_total = [left + right for left, right in zip(grad_total, grad_from_strength)]
+        return grad_total
 
     def backward_transition(self, cache: dict[str, object], grad_next_hidden: list[float], grad_reward: float, learning_rate: float) -> list[float]:
         next_hidden = cache["next_hidden"]  # type: ignore[index]
@@ -231,13 +249,16 @@ class MuZeroNetwork:
         self.representation.backward(cache["observation"], cache["outputs"], grad_hidden, learning_rate)  # type: ignore[index]
 
     def state_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "representation": self.representation.state_dict(),
             "dynamics": self.dynamics.state_dict(),
             "reward_head": self.reward_head.state_dict(),
             "policy_head": self.policy_head.state_dict(),
             "value_head": self.value_head.state_dict(),
         }
+        if self.strength_head is not None:
+            payload["strength_head"] = self.strength_head.state_dict()
+        return payload
 
     def load_state_dict(self, state: dict[str, object]) -> list[str]:
         migrations: list[str] = []
@@ -254,6 +275,14 @@ class MuZeroNetwork:
             migration = layer.load_state_dict(layer_state)
             if migration:
                 migrations.append(f"{name} {migration}")
+        if self.strength_head is not None:
+            strength_state = state.get("strength_head")
+            if isinstance(strength_state, dict):
+                migration = self.strength_head.load_state_dict(strength_state)
+                if migration:
+                    migrations.append(f"strength_head {migration}")
+            else:
+                migrations.append("strength_head init")
         return migrations
 
 
@@ -275,8 +304,10 @@ class MuZeroAgent:
         combat_end_sample_bonus: float = 1.0,
         act_end_sample_bonus: float = 3.0,
         run_end_sample_bonus: float = 7.0,
+        strength_target_size: int = 0,
+        strength_loss_weight: float = 0.25,
     ) -> None:
-        self.network = MuZeroNetwork(observation_size, action_size, hidden_size, seed)
+        self.network = MuZeroNetwork(observation_size, action_size, hidden_size, seed, strength_target_size=strength_target_size)
         self.learning_rate = learning_rate
         self.discount = discount
         self.simulations = simulations
@@ -287,13 +318,28 @@ class MuZeroAgent:
         self.combat_end_sample_bonus = combat_end_sample_bonus
         self.act_end_sample_bonus = act_end_sample_bonus
         self.run_end_sample_bonus = run_end_sample_bonus
+        self.strength_loss_weight = max(0.0, float(strength_loss_weight))
         self.replay = ReplayBuffer(replay_capacity)
         self.rng = random.Random(seed + 17)
         self.training_steps = 0
+        self.episode_index = 1
 
-    def plan(self, observation: list[float], legal_actions: list[int], use_exploration_noise: bool = True) -> SearchResult:
+    def plan(
+        self,
+        observation: list[float],
+        legal_actions: list[int],
+        use_exploration_noise: bool = True,
+        simulations_override: int | None = None,
+        time_budget_seconds: float | None = None,
+        prior_biases: dict[int, float] | None = None,
+    ) -> SearchResult:
         hidden, _ = self.network.represent(observation, cache=False)
-        logits, root_value = self.network.predict(hidden)
+        logits, root_value, _ = self.network.predict(hidden)
+        if prior_biases:
+            logits = list(logits)
+            for action, bias in prior_biases.items():
+                if 0 <= action < len(logits):
+                    logits[action] += float(bias)
         priors = _masked_softmax(logits, legal_actions)
         if use_exploration_noise and len(legal_actions) > 1:
             noise = [self.rng.gammavariate(self.dirichlet_alpha, 1.0) for _ in legal_actions]
@@ -308,7 +354,11 @@ class MuZeroAgent:
         if not legal_actions:
             return SearchResult(priors, visit_counts, root_value)
 
-        for _ in range(max(1, self.simulations)):
+        simulation_limit = max(1, int(simulations_override if simulations_override is not None else self.simulations))
+        deadline = time.monotonic() + float(time_budget_seconds) if time_budget_seconds is not None and time_budget_seconds > 0.0 else None
+        for simulation_index in range(simulation_limit):
+            if deadline is not None and simulation_index > 0 and time.monotonic() >= deadline:
+                break
             total_visits = sum(visit_counts[action] for action in legal_actions)
             best_action = legal_actions[0]
             best_score = -float("inf")
@@ -319,7 +369,7 @@ class MuZeroAgent:
                     best_action = action
             if best_action not in expanded_values:
                 next_hidden, reward, _ = self.network.transition(hidden, best_action, cache=False)
-                _, predicted_value = self.network.predict(next_hidden)
+                _, predicted_value, _ = self.network.predict(next_hidden)
                 expanded_values[best_action] = reward + self.discount * predicted_value
             estimate = expanded_values[best_action]
             visit_counts[best_action] += 1
@@ -380,6 +430,7 @@ class MuZeroAgent:
             metrics.reward_loss += current.reward_loss
             metrics.policy_loss += current.policy_loss
             metrics.consistency_loss += current.consistency_loss
+            metrics.strength_loss += current.strength_loss
             self.training_steps += 1
         scale = 1.0 / updates
         metrics.total_loss *= scale
@@ -387,26 +438,43 @@ class MuZeroAgent:
         metrics.reward_loss *= scale
         metrics.policy_loss *= scale
         metrics.consistency_loss *= scale
+        metrics.strength_loss *= scale
         return metrics
 
     def _train_transition(self, transition: Transition) -> TrainMetrics:
         hidden, rep_cache = self.network.represent(transition.observation, cache=True)
-        logits, predicted_value = self.network.predict(hidden)
+        logits, predicted_value, predicted_strength = self.network.predict(hidden)
         next_hidden_pred, predicted_reward, transition_cache = self.network.transition(hidden, transition.action_index, cache=True)
         target_next_hidden, _ = self.network.represent(transition.next_observation, cache=False)
-        _, bootstrap_value = self.network.predict(target_next_hidden)
+        _, bootstrap_value, _ = self.network.predict(target_next_hidden)
         target_value = transition.reward if transition.done else transition.reward + self.discount * bootstrap_value
 
         probabilities = _softmax(logits)
         grad_logits = [probabilities[index] - transition.policy_target[index] for index in range(len(logits))]
         grad_value = 2.0 * (predicted_value - target_value)
         grad_reward = 2.0 * (predicted_reward - transition.reward)
+        grad_strength = [0.0 for _ in range(self.network.strength_target_size)]
+        strength_loss = 0.0
+        if self.network.strength_target_size > 0 and self.strength_loss_weight > 0.0:
+            target_strength = transition.strength_target or []
+            strength_mask = transition.strength_mask or []
+            if len(target_strength) == self.network.strength_target_size and len(strength_mask) == self.network.strength_target_size:
+                active_weight = sum(max(0.0, float(value)) for value in strength_mask)
+                if active_weight > 0.0:
+                    strength_loss = sum(
+                        ((predicted - float(target)) ** 2) * max(0.0, float(mask))
+                        for predicted, target, mask in zip(predicted_strength, target_strength, strength_mask)
+                    ) / active_weight
+                    grad_strength = [
+                        (2.0 * (predicted - float(target)) * max(0.0, float(mask)) / active_weight) * self.strength_loss_weight
+                        for predicted, target, mask in zip(predicted_strength, target_strength, strength_mask)
+                    ]
         grad_next_hidden = [
             2.0 * (predicted - target) / len(next_hidden_pred)
             for predicted, target in zip(next_hidden_pred, target_next_hidden)
         ]
 
-        grad_hidden_a = self.network.backward_prediction(hidden, grad_logits, grad_value, self.learning_rate)
+        grad_hidden_a = self.network.backward_prediction(hidden, grad_logits, grad_value, grad_strength, self.learning_rate)
         grad_hidden_b = self.network.backward_transition(transition_cache, grad_next_hidden, grad_reward, self.learning_rate)
         self.network.backward_representation(rep_cache, [left + right for left, right in zip(grad_hidden_a, grad_hidden_b)], self.learning_rate)
 
@@ -414,7 +482,8 @@ class MuZeroAgent:
         value_loss = (predicted_value - target_value) ** 2
         reward_loss = (predicted_reward - transition.reward) ** 2
         consistency_loss = sum((predicted - target) ** 2 for predicted, target in zip(next_hidden_pred, target_next_hidden)) / len(next_hidden_pred)
-        return TrainMetrics(policy_loss + value_loss + reward_loss + consistency_loss, value_loss, reward_loss, policy_loss, consistency_loss)
+        total_loss = policy_loss + value_loss + reward_loss + consistency_loss + (self.strength_loss_weight * strength_loss)
+        return TrainMetrics(total_loss, value_loss, reward_loss, policy_loss, consistency_loss, strength_loss)
 
     def save(self, path: str | Path) -> None:
         destination = Path(path)
@@ -425,6 +494,8 @@ class MuZeroAgent:
             "simulations": self.simulations,
             "warmup_samples": self.warmup_samples,
             "training_steps": self.training_steps,
+            "episode_index": self.episode_index,
+            "strength_loss_weight": self.strength_loss_weight,
             "replay_weights": {
                 "turn_end_sample_bonus": self.turn_end_sample_bonus,
                 "combat_end_sample_bonus": self.combat_end_sample_bonus,
@@ -435,6 +506,7 @@ class MuZeroAgent:
                 "observation_size": self.network.observation_size,
                 "action_size": self.network.action_size,
                 "hidden_size": self.network.hidden_size,
+                "strength_target_size": self.network.strength_target_size,
             },
             "network": self.network.state_dict(),
         }
@@ -447,6 +519,8 @@ class MuZeroAgent:
         self.simulations = int(payload.get("simulations", self.simulations))
         self.warmup_samples = int(payload.get("warmup_samples", self.warmup_samples))
         self.training_steps = int(payload.get("training_steps", self.training_steps))
+        self.episode_index = max(1, int(payload.get("episode_index", self.episode_index)))
+        self.strength_loss_weight = float(payload.get("strength_loss_weight", self.strength_loss_weight))
         replay_weights = payload.get("replay_weights")
         if isinstance(replay_weights, dict):
             self.turn_end_sample_bonus = float(replay_weights.get("turn_end_sample_bonus", self.turn_end_sample_bonus))
@@ -460,6 +534,7 @@ class MuZeroAgent:
                 ("observation_size", self.network.observation_size),
                 ("action_size", self.network.action_size),
                 ("hidden_size", self.network.hidden_size),
+                ("strength_target_size", self.network.strength_target_size),
             ):
                 loaded_value = architecture.get(key)
                 if isinstance(loaded_value, int) and loaded_value != current_value:

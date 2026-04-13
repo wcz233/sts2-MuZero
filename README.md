@@ -27,7 +27,7 @@ The current version can also auto-dismiss post-run screens and start a fresh run
   - replay buffer
   - minimal MuZero-style representation/dynamics/prediction model
   - shallow root search
-  - online SGD training
+  - episode-end SGD training
   - boundary-weighted replay sampling for combat / act / run endings
 - `sts2_muzero/cli.py`
   - shell training loop
@@ -54,18 +54,88 @@ Example flags:
 
 ```powershell
 python run_training.py --character Ironclad --ascension 0 --resume
-python run_training.py --simulations 32 --updates-per-step 4 --checkpoint-interval 25
+python run_training.py --simulations 32 --updates-per-episode 4 --checkpoint-interval 25
 python run_training.py --temperature 0.25 --no-root-noise
 python run_training.py --max-steps 200
 python run_training.py --manual-start
+python run_training.py --enable-episode-logs
+python run_training.py --enable-episode-logs --episode-log-dir episode_logs --episode-log-model-name latest
 ```
+
+Episode log flags:
+
+- `--enable-episode-logs`
+  - enables compressed `.logs` archive writing; default is off
+- `--disable-episode-logs` / `--no-episode-logs`
+  - disables archive writing explicitly
+- `--episode-log-dir episode_logs`
+  - writes one compressed `.logs` archive per finished episode
+- `--episode-log-model-name latest`
+  - overrides the `model` segment in the filename
+
+Each archive filename follows:
+
+```text
+<character>-<highest_floor>-<episode_index>-<date:YYYYMMDD>-<time:HHMMSS>-<model>.logs
+```
+
+The archive stores:
+
+- one lossless global-state store for the whole episode, compressed with JSON delta patches plus `lzma/xz`
+- one floor node per visited map node, grouped by node type rather than one file per combat
+- one action timeline inside each node with only the changed global-state fields listed per step
+- node-specific details for:
+  - combat: battle entry snapshot, turn grouping for both sides, post-combat rewards, result
+  - shop: shop inventory snapshot and purchase records
+  - rest site: campfire options and chosen action
+  - event: event options, selected option, dialogue progression, and resulting state deltas
+  - question mark: original `?` route plus `resolved_type`, then the resolved node content
+  - treasure: available rewards and claimed item
+- final episode result, highest floor, node counts, and reward summary
+
+The archive intentionally does not store MuZero search internals, observations, or model state. It stores only the environment-facing episode state/action/result data needed for offline replay or training data extraction.
+
+Archives are written as minified JSON compressed with built-in `lzma` so they stay lossless and can be reconstructed exactly.
+
+## Read Episode Logs
+
+```powershell
+python -m sts2_muzero.log_reader summary episode_logs\Ironclad-17-52-20260407-224430-latest.logs
+python -m sts2_muzero.log_reader nodes episode_logs\...\some.logs
+python -m sts2_muzero.log_reader timeline episode_logs\...\some.logs --node-index 3
+python -m sts2_muzero.log_reader show-node episode_logs\...\some.logs 3 --states both
+python -m sts2_muzero.log_reader show-step episode_logs\...\some.logs 3 5 --states both
+python -m sts2_muzero.log_reader export-json episode_logs\...\some.logs --output expanded.json
+```
+
+If the package is installed, the same reader is also exposed as:
+
+```powershell
+sts2-muzero-logs summary <path-to-log>
+```
+
+Useful reader commands:
+
+- `summary`
+  - print episode metadata, reward summary, and node counts
+- `nodes`
+  - list all floor nodes with type, resolved type, route info, and node-specific counts
+- `timeline`
+  - print the action timeline for the whole episode or a single node
+- `show-node`
+  - dump one node in full, optionally with entry/final global state
+- `show-step`
+  - dump one action record in full, optionally with before/after global state
+- `export-json`
+  - export decompressed JSON with all decoded global states for downstream training or analysis
 
 ## Example shell output
 
 ```text
-[09:12:03] step=18 ep=1 act=1 floor=4 hp=63/80 state=monster action=play Strike -> Jaw Worm reward=+1.240 ep_reward=+8.510 root_value=+0.318 loss=0.9412 value=0.2115 reward=0.0321 policy=0.5943 consistency=0.1033
-[09:12:17] step=26 ep=1 act=1 floor=4 hp=58/80 state=rewards action=end turn reward=+8.420 ep_reward=+16.930 root_value=+0.502 loss=0.8841 value=0.1932 reward=0.0510 policy=0.5319 consistency=0.1080 boundary=combat_end
-[09:12:17] combat_end ep=1 act=1 floor=4 steps=9 reward=+10.280 result=victory
-[09:24:51] act_summary ep=1 act=1 reason=act_end steps=88 floors=1->18 combats=8 reward=+54.720
-[09:40:02] run_end ep=1 steps=173 combats=17 shaped_return=+71.580 result=defeat replay=173 combat=17 act=1 run=1
+[09:12:03] step=18 ep=1 act=1 floor=4 hp=63/80 state=monster action=play Strike -> Jaw Worm reward=+1.240 ep_raw_reward=+8.510 root_value=+0.318 loss=deferred_ep
+[09:12:17] step=26 ep=1 act=1 floor=4 hp=58/80 state=rewards action=end turn reward=+8.420 ep_raw_reward=+16.930 root_value=+0.502 loss=deferred_ep boundary=combat_end
+[09:12:17] combat_end ep=1 act=1 floor=4 steps=9 raw_reward=+10.280 result=victory
+[09:24:51] act_summary ep=1 act=1 reason=act_end steps=88 floors=1->18 combats=8 raw_reward=+54.720
+[09:40:02] episode_train ep=1 updates=4 loss=0.8841 value=0.1932 reward=0.0510 policy=0.5319 consistency=0.1080
+[09:40:02] run_end ep=1 steps=173 combats=17 raw_return=+71.580 episode_settlement=+3.240 result=defeat replay=173 combat=17 act=1 run=1
 ```

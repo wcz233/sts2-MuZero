@@ -1,13 +1,14 @@
 import argparse
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from .action_space import ACTION_SPACE_SIZE
+from .action_space import ACTION_SPACE_SIZE, action_spec
 from .bridge import STS2Bridge, STS2BridgeError
+from .combat_logs import EpisodeArchiveRecorder
 from .env import (
-    BASE_OBSERVATION_SIZE,
+    AUXILIARY_STRENGTH_TARGET_SIZE,
     COMBAT_STATE_TYPES,
     OBSERVATION_SIZE,
     RewardWeights,
@@ -17,10 +18,12 @@ from .env import (
     SEMANTIC_RELATION_SIZE,
     SEMANTIC_SCALAR_SIZE,
     STS2MuZeroEnv,
+    STATE_SPACE_OBSERVATION_SIZE,
 )
 from .muzero import MuZeroAgent, Transition
 
 COMBAT_WAIT_STATE_TYPES = COMBAT_STATE_TYPES | {"hand_select"}
+COMBAT_SELECTION_STATE_TYPES = {"hand_select"}
 
 
 def _timestamp() -> str:
@@ -116,7 +119,8 @@ def _format_metrics(metrics: object) -> str:
         f"value={metrics.value_loss:.4f} "
         f"reward={metrics.reward_loss:.4f} "
         f"policy={metrics.policy_loss:.4f} "
-        f"consistency={metrics.consistency_loss:.4f}"
+        f"consistency={metrics.consistency_loss:.4f} "
+        f"strength={metrics.strength_loss:.4f}"
     )
 
 
@@ -125,16 +129,11 @@ class SettlementConfig:
     signal_mode: str = "mean"
     normalization: str = "sum"
     clip: float = 10.0
-    turn_weight: float = 1.0
-    turn_clean_cap: float = 0.15
-    turn_skip_penalty: float = 0.0
-    combat_weight: float = 1.5
-    act_weight: float = 0.5
-    run_weight: float = 0.25
-    turn_decay: float = 0.90
-    combat_decay: float = 0.97
-    act_decay: float = 0.985
-    run_decay: float = 0.995
+    episode_weight: float = 0.25
+    map_route_defeat_gold_reference_reward: float = 1.0
+    map_route_defeat_gold_penalty_multiplier: float = 10.0
+    map_route_defeat_gold_threshold: float = 200.0
+    episode_decay: float = 0.995
 
 
 @dataclass
@@ -145,10 +144,8 @@ class TurnWindow:
     start_step: int
     steps: int = 0
     reward: float = 0.0
-    settlement_reward: float = 0.0
     skip_unspent_count: int = 0
     skip_unspent_energy: int = 0
-    history: list[Transition] = field(default_factory=list)
 
 
 @dataclass
@@ -158,7 +155,6 @@ class CombatWindow:
     start_step: int
     steps: int = 0
     reward: float = 0.0
-    history: list[Transition] = field(default_factory=list)
 
 
 @dataclass
@@ -169,7 +165,6 @@ class ActWindow:
     steps: int = 0
     reward: float = 0.0
     combats: int = 0
-    history: list[Transition] = field(default_factory=list)
 
 
 def _run_position(state: dict[str, object]) -> tuple[int, int]:
@@ -198,6 +193,39 @@ def _is_player_combat_turn(state: dict[str, object]) -> bool:
 def _combat_round(state: dict[str, object]) -> int:
     battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
     return int(battle.get("round", 0) or 0)
+
+
+def _combat_wait_reason_text(state: dict[str, object]) -> str:
+    state_type = str(state.get("state_type", "unknown"))
+    if state_type == "hand_select":
+        hand_select = state.get("hand_select") if isinstance(state.get("hand_select"), dict) else {}
+        selected_cards = hand_select.get("selected_cards") if isinstance(hand_select.get("selected_cards"), list) else []
+        mode = str(hand_select.get("mode", "") or "")
+        return (
+            f" mode={mode or '-'}"
+            f" selected={len(selected_cards)}"
+            f" can_confirm={int(bool(hand_select.get('can_confirm')))}"
+        )
+    if state_type not in COMBAT_STATE_TYPES:
+        return ""
+    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+    turn = str(battle.get("turn", "") or "")
+    round_index = _combat_round(state)
+    if turn != "player":
+        return f" turn={turn or '-'} round={round_index}"
+    reasons: list[str] = []
+    if not bool(battle.get("is_play_phase")):
+        reasons.append("not_play_phase")
+    if bool(battle.get("player_actions_disabled")):
+        reasons.append("actions_disabled")
+    if bool(battle.get("hand_in_card_play")):
+        reasons.append("hand_in_card_play")
+    hand_mode = str(battle.get("hand_mode", "play") or "play").lower()
+    if hand_mode != "play":
+        reasons.append(f"hand_mode={hand_mode}")
+    if not reasons:
+        reasons.append("no_action_window")
+    return f" turn=player round={round_index} wait={','.join(reasons)}"
 
 
 def _open_turn_window(state: dict[str, object], next_step: int) -> TurnWindow | None:
@@ -309,16 +337,37 @@ def _apply_window_settlement(
     return _apply_credit_settlement(history, total_bonus, decay, config.normalization)
 
 
-def _apply_turn_settlement(
-    window: TurnWindow,
+def _run_remaining_gold(previous_state: dict[str, object], next_state: dict[str, object]) -> float:
+    for candidate in (next_state, previous_state):
+        player = candidate.get("player") if isinstance(candidate.get("player"), dict) else {}
+        if player:
+            return max(0.0, float(player.get("gold", 0) or 0.0))
+    return 0.0
+
+
+def _apply_map_route_defeat_gold_penalty(
+    history: list[Transition],
+    previous_state: dict[str, object],
+    next_state: dict[str, object],
     config: SettlementConfig,
-) -> float:
-    if not window.history or config.turn_weight == 0.0:
-        return 0.0
-    signal = _settlement_signal(window.settlement_reward, window.steps, config.signal_mode)
-    signal = min(signal, config.turn_clean_cap)
-    total_bonus = _clip_value(config.turn_weight * signal, config.clip)
-    return _apply_credit_settlement(window.history, total_bonus, config.turn_decay, config.normalization)
+) -> tuple[float, float, int, float]:
+    if config.map_route_defeat_gold_penalty_multiplier <= 0.0 or config.map_route_defeat_gold_threshold <= 0.0:
+        return 0.0, 0.0, 0, 0.0
+    player = next_state.get("player") if isinstance(next_state.get("player"), dict) else {}
+    if float(player.get("hp", 0) or 0.0) > 0.0:
+        return 0.0, 0.0, 0, 0.0
+    remaining_gold = _run_remaining_gold(previous_state, next_state)
+    if remaining_gold <= config.map_route_defeat_gold_threshold:
+        return 0.0, remaining_gold, 0, 0.0
+    map_history = [transition for transition in history if action_spec(transition.action_index).kind == "map_choose_node"]
+    if not map_history:
+        return 0.0, remaining_gold, 0, 0.0
+    effective_multiplier = config.map_route_defeat_gold_penalty_multiplier * (
+        remaining_gold / config.map_route_defeat_gold_threshold
+    )
+    total_penalty = -(config.map_route_defeat_gold_reference_reward * effective_multiplier)
+    applied = _apply_credit_settlement(map_history, total_penalty, config.episode_decay, config.normalization)
+    return applied, remaining_gold, len(map_history), effective_multiplier
 
 
 def _reward_display(transition: Transition) -> str:
@@ -335,6 +384,7 @@ def _global_positive_reward_reference(args: argparse.Namespace, settlement_confi
     candidates = [
         max(0.0, args.floor_advance_weight),
         max(0.0, args.act_advance_weight),
+        max(0.0, args.map_route_choice_weight),
         max(0.0, args.hp_delta_weight),
         max(0.0, args.gold_delta_weight),
         max(0.0, args.enemy_hp_delta_weight),
@@ -343,13 +393,8 @@ def _global_positive_reward_reference(args: argparse.Namespace, settlement_confi
         max(0.0, args.act_end_weight),
         max(0.0, args.run_victory_weight),
         max(0.0, args.combat_tactical_shaping),
-        max(0.0, settlement_config.turn_weight * settlement_config.turn_clean_cap),
     ]
-    if settlement_config.combat_weight > 0.0:
-        candidates.append(settlement_config.clip)
-    if settlement_config.act_weight > 0.0:
-        candidates.append(settlement_config.clip)
-    if settlement_config.run_weight > 0.0:
+    if settlement_config.episode_weight > 0.0:
         candidates.append(settlement_config.clip)
     return max(1.0, max(candidates))
 
@@ -359,6 +404,14 @@ def _resolve_turn_skip_penalty(args: argparse.Namespace, settlement_config: Sett
         return args.turn_skip_unspent_penalty, 0.0
     positive_reference = _global_positive_reward_reference(args, settlement_config)
     return positive_reference * max(0.0, args.turn_skip_unspent_multiplier), positive_reference
+
+
+def _resolve_episode_log_model_name(args: argparse.Namespace, checkpoint_path: Path) -> str:
+    override = str(args.episode_log_model_name or "").strip()
+    if override:
+        return override
+    stem = checkpoint_path.stem.strip()
+    return stem or "model"
 
 
 def main() -> None:
@@ -371,16 +424,21 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--discount", type=float, default=0.997)
     parser.add_argument("--simulations", type=int, default=40)
-    parser.add_argument("--updates-per-step", type=int, default=1)
+    parser.add_argument("--combat-selection-simulations", type=int, default=12, help="When state_type=hand_select, cap MuZero simulations to this many")
+    parser.add_argument("--combat-selection-search-time-budget-seconds", type=float, default=0.05, help="When state_type=hand_select, stop search after this many seconds; <=0 disables the wall-clock cap")
+    parser.add_argument("--updates-per-episode", type=int, default=1, help="Run this many replay SGD updates after each finished episode")
+    parser.add_argument("--updates-per-step", dest="updates_per_episode", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--replay-capacity", type=int, default=12000)
     parser.add_argument("--warmup-samples", type=int, default=1000)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--poll-interval", type=float, default=0.15)
+    parser.add_argument("--max-poll-attempts", type=int, default=40)
     parser.add_argument("--menu-sleep", type=float, default=2.0)
     parser.add_argument("--error-penalty-weight", type=float, default=1.0)
     parser.add_argument("--floor-advance-weight", type=float, default=5.0)
     parser.add_argument("--act-advance-weight", type=float, default=20.0)
+    parser.add_argument("--map-route-choice-weight", type=float, default=1.5, help="Immediate reward shaping weight for route selections based on deck/relic/resource readiness")
     parser.add_argument("--hp-delta-weight", type=float, default=5.0, help="Weight applied to normalized player HP delta (hp_delta / max_hp)")
     parser.add_argument("--gold-delta-weight", type=float, default=0.5, help="Weight applied to normalized gold delta (gold_delta / gold_delta_scale)")
     parser.add_argument("--gold-delta-scale", type=float, default=25.0, help="Reference scale used to normalize gold delta rewards")
@@ -395,19 +453,23 @@ def main() -> None:
     parser.add_argument("--run-defeat-weight", type=float, default=-10.0)
     parser.add_argument("--combat-tactical-shaping", type=float, default=0.35, help="Combat-local potential shaping weight")
     parser.add_argument("--end-turn-slack-penalty", type=float, default=0.5, help="Penalty scale for ending turn with playable cards and spare energy")
-    parser.add_argument("--settlement-signal-mode", choices=["mean", "sum", "sqrt"], default="mean", help="How to convert a turn/combat/act/run raw return into a settlement signal")
+    parser.add_argument("--settlement-signal-mode", choices=["mean", "sum", "sqrt"], default="mean", help="How to convert the full episode raw return into an episode-end settlement signal")
     parser.add_argument("--settlement-normalization", choices=["sum", "none"], default="sum", help="Whether to normalize historical settlement weights to a fixed total bonus")
-    parser.add_argument("--settlement-clip", type=float, default=10.0, help="Absolute clip applied to each hierarchy settlement total bonus")
-    parser.add_argument("--turn-settlement-weight", type=float, default=1.0, help="Retroactive credit weight for the current turn history")
-    parser.add_argument("--turn-settlement-clean-cap", type=float, default=0.15, help="Cap applied to clean turn-end settlement signal so ordinary turn ends only get a minimal bonus")
-    parser.add_argument("--turn-settlement-skip-penalty", type=float, default=0.0, help="Deprecated compatibility knob; skip penalty is now assigned only to the end_turn transition")
-    parser.add_argument("--combat-settlement-weight", type=float, default=1.5, help="Retroactive credit weight for the current combat history")
-    parser.add_argument("--act-settlement-weight", type=float, default=0.5, help="Retroactive credit weight for the current act history")
-    parser.add_argument("--run-settlement-weight", type=float, default=0.25, help="Retroactive credit weight for the current run history")
-    parser.add_argument("--turn-settlement-decay", type=float, default=0.90)
-    parser.add_argument("--combat-settlement-decay", type=float, default=0.97)
-    parser.add_argument("--act-settlement-decay", type=float, default=0.985)
-    parser.add_argument("--run-settlement-decay", type=float, default=0.995)
+    parser.add_argument("--settlement-clip", type=float, default=10.0, help="Absolute clip applied to the episode-end settlement total bonus")
+    parser.add_argument("--episode-settlement-weight", type=float, default=0.25, help="Retroactive credit weight applied once to the full episode history at episode end")
+    parser.add_argument("--run-settlement-weight", dest="episode_settlement_weight", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--map-route-defeat-gold-penalty-multiplier", type=float, default=10.0, help="On run defeat with remaining gold above threshold, base map route penalty becomes baseline_reward_reference * this multiplier, then scales linearly with remaining_gold / threshold; <=0 disables")
+    parser.add_argument("--map-route-defeat-gold-threshold", type=float, default=200.0, help="Remaining gold must be greater than this threshold to trigger defeat-time map route penalty")
+    parser.add_argument("--episode-settlement-decay", type=float, default=0.995, help="Decay applied when distributing episode-end settlement backward across the episode history")
+    parser.add_argument("--run-settlement-decay", dest="episode_settlement_decay", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--turn-settlement-weight", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--turn-settlement-clean-cap", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--turn-settlement-skip-penalty", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--combat-settlement-weight", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--act-settlement-weight", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--turn-settlement-decay", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--combat-settlement-decay", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--act-settlement-decay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--turn-end-sample-bonus", type=float, default=0.0, help="Replay sampling bonus for turn_end transitions")
     parser.add_argument("--combat-end-sample-bonus", type=float, default=1.0, help="Replay sampling bonus for combat_end transitions")
     parser.add_argument("--act-end-sample-bonus", type=float, default=3.0, help="Replay sampling bonus for act_end transitions")
@@ -420,6 +482,12 @@ def main() -> None:
     parser.add_argument("--card-reward-preview-guard-timeout-seconds", type=float, default=3.0, help="When rewards contain a card reward, keep proceed hidden until the agent opens the card reward once or this timeout expires; <=0 means strict blocking until opened")
     parser.add_argument("--checkpoint-path", default="checkpoints/latest.json")
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
+    parser.add_argument("--strength-loss-weight", type=float, default=0.25, help="Auxiliary loss weight for explicit deck/risk strength semantics")
+    parser.set_defaults(enable_episode_logs=False)
+    parser.add_argument("--enable-episode-logs", dest="enable_episode_logs", action="store_true", help="Enable one compressed .logs archive per episode")
+    parser.add_argument("--disable-episode-logs", "--no-episode-logs", "--no-battle-logs", dest="enable_episode_logs", action="store_false", help="Disable episode archive logging")
+    parser.add_argument("--episode-log-dir", "--battle-log-dir", dest="episode_log_dir", default="episode_logs", help="Directory used for per-episode compressed .logs archives")
+    parser.add_argument("--episode-log-model-name", "--battle-log-model-name", dest="episode_log_model_name", default="", help="Override the model name segment used in episode log filenames")
     parser.add_argument("--character", default="Ironclad", help="Character to auto-start after menu/game_over")
     parser.add_argument("--ascension", type=int, default=0, help="-1 keeps the game's current ascension selection")
     parser.add_argument("--manual-start", action="store_true", help="Disable automatic run start/restart")
@@ -431,22 +499,19 @@ def main() -> None:
         signal_mode=args.settlement_signal_mode,
         normalization=args.settlement_normalization,
         clip=args.settlement_clip,
-        turn_weight=args.turn_settlement_weight,
-        turn_clean_cap=args.turn_settlement_clean_cap,
-        turn_skip_penalty=args.turn_settlement_skip_penalty,
-        combat_weight=args.combat_settlement_weight,
-        act_weight=args.act_settlement_weight,
-        run_weight=args.run_settlement_weight,
-        turn_decay=args.turn_settlement_decay,
-        combat_decay=args.combat_settlement_decay,
-        act_decay=args.act_settlement_decay,
-        run_decay=args.run_settlement_decay,
+        episode_weight=args.episode_settlement_weight,
+        episode_decay=args.episode_settlement_decay,
     )
+    positive_reward_reference = _global_positive_reward_reference(args, settlement_config)
+    settlement_config.map_route_defeat_gold_reference_reward = positive_reward_reference
+    settlement_config.map_route_defeat_gold_penalty_multiplier = max(0.0, float(args.map_route_defeat_gold_penalty_multiplier))
+    settlement_config.map_route_defeat_gold_threshold = max(0.0, float(args.map_route_defeat_gold_threshold))
     resolved_turn_skip_penalty, turn_skip_reference = _resolve_turn_skip_penalty(args, settlement_config)
     reward_weights = RewardWeights(
         error_penalty=args.error_penalty_weight,
         floor_advance=args.floor_advance_weight,
         act_advance=args.act_advance_weight,
+        map_route_choice=args.map_route_choice_weight,
         hp_delta=args.hp_delta_weight,
         gold_delta=args.gold_delta_weight,
         gold_delta_scale=args.gold_delta_scale,
@@ -465,6 +530,7 @@ def main() -> None:
     env = STS2MuZeroEnv(
         STS2Bridge(args.host, args.port, args.timeout),
         poll_interval=args.poll_interval,
+        max_poll_attempts=args.max_poll_attempts,
         reward_discount=args.discount,
         reward_weights=reward_weights,
         card_select_candidate_limit=args.card_select_candidate_limit,
@@ -488,27 +554,43 @@ def main() -> None:
         combat_end_sample_bonus=args.combat_end_sample_bonus,
         act_end_sample_bonus=args.act_end_sample_bonus,
         run_end_sample_bonus=args.run_end_sample_bonus,
+        strength_target_size=AUXILIARY_STRENGTH_TARGET_SIZE,
+        strength_loss_weight=args.strength_loss_weight,
     )
     checkpoint_path = Path(args.checkpoint_path)
+    episode_log_dir = None if not args.enable_episode_logs or not str(args.episode_log_dir).strip() else Path(str(args.episode_log_dir).strip())
+    episode_log_model_name = _resolve_episode_log_model_name(args, checkpoint_path)
+    episode_log_recorder = EpisodeArchiveRecorder(
+        log_dir=episode_log_dir,
+        model_name=episode_log_model_name,
+        checkpoint_path=checkpoint_path,
+        fallback_character=args.character,
+    )
+    episode_index = 1
     if args.resume and checkpoint_path.exists():
         migrations = agent.load(checkpoint_path)
+        episode_index = max(1, int(getattr(agent, "episode_index", 1)))
         migration_suffix = f" migrated={' ; '.join(migrations)}" if migrations else ""
-        print(f"[{_timestamp()}] loaded checkpoint from {checkpoint_path}{migration_suffix}", flush=True)
+        print(f"[{_timestamp()}] loaded checkpoint from {checkpoint_path} next_ep={episode_index}{migration_suffix}", flush=True)
 
     print(
-        f"[{_timestamp()}] obs={OBSERVATION_SIZE} base_obs={BASE_OBSERVATION_SIZE} "
+        f"[{_timestamp()}] obs={OBSERVATION_SIZE} state_obs={STATE_SPACE_OBSERVATION_SIZE} "
         f"semantic_obs={SEMANTIC_OBSERVATION_SIZE} "
         f"(concepts={SEMANTIC_CONCEPT_SIZE} scalars={SEMANTIC_SCALAR_SIZE} "
         f"relations={SEMANTIC_RELATION_SIZE} history={SEMANTIC_HISTORY_SIZE}) "
         f"actions={ACTION_SPACE_SIZE} "
         f"hidden={args.hidden_size} lr={args.learning_rate:.5g} simulations={args.simulations} "
-        f"updates={args.updates_per_step} replay={args.replay_capacity} warmup={args.warmup_samples} temp={args.temperature:.2f} "
-        f"character={args.character} ascension={'keep' if args.ascension < 0 else args.ascension}",
+        f"combat_order_bias=on "
+        f"hand_select_search={args.combat_selection_simulations}@"
+        f"{'off' if args.combat_selection_search_time_budget_seconds <= 0.0 else f'{args.combat_selection_search_time_budget_seconds:.2f}s'} "
+        f"updates/ep={args.updates_per_episode} replay={args.replay_capacity} warmup={args.warmup_samples} temp={args.temperature:.2f} "
+        f"character={args.character} ascension={'keep' if args.ascension < 0 else args.ascension} "
+        f"strength_aux={AUXILIARY_STRENGTH_TARGET_SIZE}@w{args.strength_loss_weight:.2f}",
         flush=True,
     )
     print(
         f"[{_timestamp()}] reward_w="
-        f"err:{args.error_penalty_weight:.2f} floor:{args.floor_advance_weight:.2f} act:{args.act_advance_weight:.2f} "
+        f"err:{args.error_penalty_weight:.2f} floor:{args.floor_advance_weight:.2f} act:{args.act_advance_weight:.2f} route:{args.map_route_choice_weight:.2f} "
         f"hp:{args.hp_delta_weight:.2f}/maxhp gold:{args.gold_delta_weight:.2f}@{args.gold_delta_scale:.0f} "
         f"enemy:{args.enemy_hp_delta_weight:.2f}/enemymax "
         f"turn:{args.turn_end_weight:.2f} turn_skip:{resolved_turn_skip_penalty:.2f}/energy"
@@ -524,21 +606,26 @@ def main() -> None:
     print(
         f"[{_timestamp()}] settlement="
         f"{args.settlement_signal_mode}/{args.settlement_normalization} clip={args.settlement_clip:.2f} "
-        f"turn:{args.turn_settlement_weight:.2f}@{args.turn_settlement_decay:.3f}/cap{args.turn_settlement_clean_cap:.2f}/skip_local_only "
-        f"combat:{args.combat_settlement_weight:.2f}@{args.combat_settlement_decay:.3f} "
-        f"act:{args.act_settlement_weight:.2f}@{args.act_settlement_decay:.3f} "
-        f"run:{args.run_settlement_weight:.2f}@{args.run_settlement_decay:.3f} "
+        f"episode:{args.episode_settlement_weight:.2f}@{args.episode_settlement_decay:.3f} "
+        f"baseline_ref:{positive_reward_reference:.2f} "
+        f"map_fail_gold:{settlement_config.map_route_defeat_gold_penalty_multiplier:.2f}x@>{settlement_config.map_route_defeat_gold_threshold:.0f} "
         f"replay_bonus={agent.turn_end_sample_bonus:.1f}/{agent.combat_end_sample_bonus:.1f}/"
         f"{agent.act_end_sample_bonus:.1f}/{agent.run_end_sample_bonus:.1f}",
         flush=True,
     )
+    print(
+        f"[{_timestamp()}] episode_logs="
+        f"{'off' if episode_log_dir is None else episode_log_dir} "
+        f"model={episode_log_model_name} reader=python -m sts2_muzero.log_reader",
+        flush=True,
+    )
 
     state = _wait_for_run(env, args.menu_sleep, args.character, args.ascension, args.manual_start)
-    episode_index = 1
     episode_steps = 0
     episode_reward = 0.0
     episode_combats = 0
     total_steps = 0
+    episode_log_recorder.start_episode(state, total_steps + 1, episode_index)
     act_window = _open_act_window(state, total_steps + 1)
     combat_window = _open_combat_window(state, total_steps + 1)
     turn_window = _open_turn_window(state, total_steps + 1)
@@ -559,8 +646,10 @@ def main() -> None:
             log_state = (total_steps, str(state.get("state_type", "unknown")))
             now = time.monotonic()
             if log_state != last_no_legal_log_state or now - last_no_legal_log_at >= 1.0:
+                wait_reason = _combat_wait_reason_text(state)
+                wait_suffix = f" {wait_reason}" if wait_reason else ""
                 print(
-                    f"[{_timestamp()}] step={total_steps} state={state.get('state_type')} no legal actions; polling sleep={sleep_seconds:.2f}s",
+                    f"[{_timestamp()}] step={total_steps} state={state.get('state_type')} no legal actions; polling sleep={sleep_seconds:.2f}s{wait_suffix}",
                     flush=True,
                 )
                 last_no_legal_log_state = log_state
@@ -575,8 +664,28 @@ def main() -> None:
         last_no_legal_log_state = None
 
         observation = env.extract_observation_features(state)
-        search = agent.plan(observation, legal_actions, use_exploration_noise=not args.no_root_noise)
+        strength_target, strength_mask = env.extract_strength_targets(state)
+        prior_biases = env.build_action_prior_biases(state, legal_action_map)
+        state_type = str(state.get("state_type", "unknown"))
+        selection_simulations = None
+        selection_time_budget = None
+        if state_type in COMBAT_SELECTION_STATE_TYPES:
+            selection_simulations = max(1, int(args.combat_selection_simulations))
+            selection_time_budget = (
+                float(args.combat_selection_search_time_budget_seconds)
+                if args.combat_selection_search_time_budget_seconds > 0.0
+                else None
+            )
+        search = agent.plan(
+            observation,
+            legal_actions,
+            use_exploration_noise=not args.no_root_noise,
+            simulations_override=selection_simulations,
+            time_budget_seconds=selection_time_budget,
+            prior_biases=prior_biases,
+        )
         action_id = agent.select_action(search, legal_actions, temperature=args.temperature)
+        selected_bound_action = legal_action_map[action_id]
         next_state, raw_reward, done, info = env.step(action_id, state)
         transition = Transition(
             observation=observation,
@@ -585,6 +694,8 @@ def main() -> None:
             next_observation=env.extract_observation_features(next_state),
             done=done,
             policy_target=search.action_probabilities,
+            strength_target=strength_target,
+            strength_mask=strength_mask,
             raw_reward=raw_reward,
             turn_end=bool(info.get("turn_end")),
             combat_end=bool(info.get("combat_end")),
@@ -597,77 +708,72 @@ def main() -> None:
         if act_window is not None:
             act_window.steps += 1
             act_window.reward += raw_reward
-            act_window.history.append(transition)
         if combat_window is not None:
             combat_window.steps += 1
             combat_window.reward += raw_reward
-            combat_window.history.append(transition)
         if turn_window is not None:
             turn_window.steps += 1
             turn_window.reward += raw_reward
-            turn_window.history.append(transition)
             reward_breakdown = info.get("reward_breakdown")
-            settlement_delta = raw_reward
             if isinstance(reward_breakdown, dict):
                 skip_penalty = float(reward_breakdown.get("turn_skip_unspent", 0.0) or 0.0)
-                settlement_delta -= skip_penalty
                 if skip_penalty < 0.0:
                     turn_window.skip_unspent_count += 1
                     turn_window.skip_unspent_energy += int(float(reward_breakdown.get("turn_skip_unspent_energy", 0.0) or 0.0))
-            turn_window.settlement_reward += settlement_delta
 
-        turn_settlement = 0.0
-        combat_settlement = 0.0
-        act_settlement = 0.0
-        run_settlement = 0.0
-        if transition.turn_end and turn_window is not None:
-            turn_settlement = _apply_turn_settlement(turn_window, settlement_config)
-        if transition.combat_end and combat_window is not None:
-            combat_settlement = _apply_window_settlement(
-                combat_window.history,
-                combat_window.reward,
-                combat_window.steps,
-                settlement_config.combat_weight,
-                settlement_config.combat_decay,
-                settlement_config,
-            )
-        if transition.act_end and act_window is not None:
-            act_settlement = _apply_window_settlement(
-                act_window.history,
-                act_window.reward,
-                act_window.steps,
-                settlement_config.act_weight,
-                settlement_config.act_decay,
-                settlement_config,
-            )
+        episode_settlement = 0.0
+        map_route_defeat_gold_penalty = 0.0
+        map_route_defeat_gold_remaining = 0.0
+        map_route_penalized_steps = 0
+        map_route_defeat_gold_multiplier = 0.0
+        metrics = None
         if done:
-            run_settlement = _apply_window_settlement(
+            episode_settlement = _apply_window_settlement(
                 run_history,
                 episode_reward,
                 max(1, episode_steps + 1),
-                settlement_config.run_weight,
-                settlement_config.run_decay,
+                settlement_config.episode_weight,
+                settlement_config.episode_decay,
                 settlement_config,
             )
-
-        agent.remember(transition)
-        metrics = agent.learn(args.updates_per_step)
+            (
+                map_route_defeat_gold_penalty,
+                map_route_defeat_gold_remaining,
+                map_route_penalized_steps,
+                map_route_defeat_gold_multiplier,
+            ) = _apply_map_route_defeat_gold_penalty(run_history, state, next_state, settlement_config)
 
         total_steps += 1
         episode_steps += 1
+        archive_path = episode_log_recorder.record_transition(
+            previous_state=state,
+            next_state=next_state,
+            transition=transition,
+            bound_action=selected_bound_action,
+            info=info,
+            total_step=total_steps,
+            episode_step=episode_steps,
+            episode_transitions=run_history if done else None,
+        )
+        if done:
+            for episode_transition in run_history:
+                agent.remember(episode_transition)
+            metrics = agent.learn(args.updates_per_episode)
 
         player = next_state.get("player") if isinstance(next_state.get("player"), dict) else {}
         run = next_state.get("run") if isinstance(next_state.get("run"), dict) else {}
+        metrics_text = _format_metrics(metrics) if done else "loss=deferred_ep"
         print(
             f"[{_timestamp()}] step={total_steps} ep={episode_index} act={run.get('act', '?')} floor={run.get('floor', '?')} "
             f"hp={player.get('hp', '?')}/{player.get('max_hp', '?')} state={next_state.get('state_type')} "
             f"action={info['description']} {_reward_display(transition)} ep_raw_reward={episode_reward:+.3f} "
-            f"root_value={search.root_value:+.3f} {_format_metrics(metrics)}"
+            f"root_value={search.root_value:+.3f} {metrics_text}"
             f"{_format_boundary_suffix(transition)}{_format_info_suffix(info)}",
             flush=True,
         )
 
         if args.checkpoint_interval > 0 and total_steps % args.checkpoint_interval == 0:
+            agent.episode_index = episode_index
             agent.save(checkpoint_path)
             print(f"[{_timestamp()}] checkpoint saved to {checkpoint_path}", flush=True)
 
@@ -675,8 +781,7 @@ def main() -> None:
             print(
                 f"[{_timestamp()}] turn_end ep={episode_index} act={turn_window.act} floor={turn_window.floor} "
                 f"round={turn_window.round} steps={turn_window.steps} raw_reward={turn_window.reward:+.3f} "
-                f"skip_unspent={turn_window.skip_unspent_count} lost_energy={turn_window.skip_unspent_energy} "
-                f"settlement={turn_settlement:+.3f}",
+                f"skip_unspent={turn_window.skip_unspent_count} lost_energy={turn_window.skip_unspent_energy}",
                 flush=True,
             )
             turn_window = _open_turn_window(next_state, total_steps + 1)
@@ -688,7 +793,7 @@ def main() -> None:
             print(
                 f"[{_timestamp()}] combat_end ep={episode_index} act={combat_window.act} floor={combat_window.floor} "
                 f"steps={combat_window.steps} raw_reward={combat_window.reward:+.3f} "
-                f"settlement={combat_settlement:+.3f} result={_combat_result(next_state, transition.run_end)}",
+                f"result={_combat_result(next_state, transition.run_end)}",
                 flush=True,
             )
             combat_window = None
@@ -699,8 +804,7 @@ def main() -> None:
             print(
                 f"[{_timestamp()}] act_summary ep={episode_index} act={act_window.act} reason=act_end "
                 f"steps={act_window.steps} floors={act_window.start_floor}->{info.get('next_floor', run.get('floor', '?'))} "
-                f"combats={act_window.combats} raw_reward={act_window.reward:+.3f} "
-                f"settlement={act_settlement:+.3f}",
+                f"combats={act_window.combats} raw_reward={act_window.reward:+.3f}",
                 flush=True,
             )
             act_window = _open_act_window(next_state, total_steps + 1) if not transition.run_end else None
@@ -710,25 +814,36 @@ def main() -> None:
                 print(
                     f"[{_timestamp()}] act_summary ep={episode_index} act={act_window.act} reason=run_end "
                     f"steps={act_window.steps} floors={act_window.start_floor}->{run.get('floor', '?')} "
-                    f"combats={act_window.combats} raw_reward={act_window.reward:+.3f} "
-                    f"settlement={act_settlement:+.3f}",
+                    f"combats={act_window.combats} raw_reward={act_window.reward:+.3f}",
+                    flush=True,
+                )
+            if args.updates_per_episode > 0:
+                print(
+                    f"[{_timestamp()}] episode_train ep={episode_index} updates={args.updates_per_episode} {_format_metrics(metrics)}",
                     flush=True,
                 )
             replay_counts = agent.replay_boundary_counts()
             result = "victory" if float(player.get("hp", 0) or 0) > 0 else "defeat"
             print(
                 f"[{_timestamp()}] run_end ep={episode_index} steps={episode_steps} combats={episode_combats} "
-                f"raw_return={episode_reward:+.3f} run_settlement={run_settlement:+.3f} "
+                f"raw_return={episode_reward:+.3f} episode_settlement={episode_settlement:+.3f} "
+                f"map_gold_penalty={map_route_defeat_gold_penalty:+.3f} gold_left={map_route_defeat_gold_remaining:.0f} "
+                f"map_mult={map_route_defeat_gold_multiplier:.2f}x map_steps={map_route_penalized_steps} "
                 f"result={result} {_format_replay_counts(replay_counts)}",
                 flush=True,
             )
+            if archive_path is not None:
+                print(f"[{_timestamp()}] episode_log saved to {archive_path}", flush=True)
+            agent.episode_index = episode_index + 1
             agent.save(checkpoint_path)
             episode_index += 1
             episode_steps = 0
             episode_reward = 0.0
             episode_combats = 0
             run_history = []
+            episode_log_recorder.reset()
             state = _wait_for_run(env, args.menu_sleep, args.character, args.ascension, args.manual_start)
+            episode_log_recorder.start_episode(state, total_steps + 1, episode_index)
             act_window = _open_act_window(state, total_steps + 1)
             combat_window = _open_combat_window(state, total_steps + 1)
             turn_window = _open_turn_window(state, total_steps + 1)
@@ -738,5 +853,6 @@ def main() -> None:
         if turn_window is None and _is_player_combat_turn(state):
             turn_window = _open_turn_window(state, total_steps + 1)
 
+    agent.episode_index = episode_index
     agent.save(checkpoint_path)
     print(f"[{_timestamp()}] final checkpoint saved to {checkpoint_path}", flush=True)

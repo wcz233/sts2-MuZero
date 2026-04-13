@@ -6,4 +6,4 @@ requires-python = ">=3.11"
 
 [project.scripts]
 sts2-muzero = "sts2_muzero.cli:main"
-
+sts2-muzero-logs = "sts2_muzero.log_reader:main"

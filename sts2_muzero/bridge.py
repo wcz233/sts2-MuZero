@@ -95,8 +95,10 @@ class STS2Bridge:
     def proceed_to_map(self) -> dict[str, object]:
         return self._post_action("proceed")
 
-    def combat_play_card(self, card_index: int, target: str | None = None) -> dict[str, object]:
+    def combat_play_card(self, card_index: int, target: str | None = None, card_id: str | None = None) -> dict[str, object]:
         payload: dict[str, object] = {"card_index": card_index}
+        if card_id is not None:
+            payload["card_id"] = card_id
         if target is not None:
             payload["target"] = target
         return self._post_action("play_card", **payload)

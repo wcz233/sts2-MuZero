@@ -36,6 +36,64 @@ ACTION_HISTORY_BUCKETS = (
     "crystal",
     "other",
 )
+COMBAT_ROUND_BUCKETS = (
+    "ROUND_0",
+    "ROUND_1",
+    "ROUND_2",
+    "ROUND_3",
+    "ROUND_4",
+    "ROUND_5",
+    "ROUND_6",
+    "ROUND_7",
+    "ROUND_8",
+    "ROUND_9",
+    "ROUND_10",
+    "ROUND_11_PLUS",
+)
+MAP_NODE_TYPES = (
+    "Start",
+    "Monster",
+    "Elite",
+    "RestSite",
+    "Shop",
+    "Event",
+    "Treasure",
+    "Boss",
+    "Unknown",
+)
+MAP_ROUTE_TRACKED_TYPES = (
+    "Monster",
+    "Elite",
+    "RestSite",
+    "Shop",
+    "Event",
+    "Treasure",
+    "Boss",
+)
+MAP_ROUTE_OPTION_COUNT = 6
+MAP_ROUTE_DEPTH_LABELS = ("DEPTH_0", "DEPTH_1", "DEPTH_2", "DEPTH_3")
+MAP_ROUTE_DEPTH_LIMIT = len(MAP_ROUTE_DEPTH_LABELS) - 1
+MAP_NODE_TYPE_INDEX = {node_type: index for index, node_type in enumerate(MAP_NODE_TYPES)}
+SHOP_SLOT_COUNT = 12
+SHOP_SLOT_CATEGORIES = ("CARD", "RELIC", "POTION", "CARD_REMOVAL", "SPECIAL", "UNKNOWN")
+EVENT_OPTION_COUNT = 5
+EVENT_OPTION_KINDS = ("NONE", "PROCEED", "RELIC", "CARD", "POTION", "KEYWORD", "TEXT", "UNKNOWN")
+HAND_SLOT_COUNT = 10
+HAND_SELECT_SLOT_COUNT = HAND_SLOT_COUNT
+CARD_SELECT_SLOT_COUNT = 20
+HAND_ORDER_PRIORITY_SCALE = 8.0
+CARD_OPERATION_KINDS = ("CONSUME", "UPGRADE", "REMOVE", "ENCHANT")
+MAP_ROUTE_SCORE_WEIGHTS = {
+    "Start": 0.0,
+    "Monster": 0.55,
+    "Elite": 0.80,
+    "RestSite": 1.10,
+    "Shop": 1.00,
+    "Event": 1.00,
+    "Treasure": 1.20,
+    "Boss": 2.80,
+    "Unknown": 0.15,
+}
 RUNTIME_CONCEPTS: dict[str, tuple[str, ...]] = {
     "STATE_TYPE": (
         "menu",
@@ -82,6 +140,7 @@ RUNTIME_CONCEPTS: dict[str, tuple[str, ...]] = {
         "Stun",
     ),
     "ENCHANTMENT_STATUS": ("None", "Normal", "Disabled"),
+    "COMBAT_ROUND_BUCKET": COMBAT_ROUND_BUCKETS,
 }
 ENTITY_GROUPS = (
     "acts",
@@ -117,6 +176,85 @@ def _normalize_model_token(value: object) -> str:
         return _slugify(text)
     parts = [_slugify(part) for part in text.split(".")]
     return ".".join(part for part in parts if part)
+
+
+def _clean_text(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text and text.lower() != "none" else ""
+
+
+def _text_has_any(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
+
+
+def _selection_text_blob(container: object) -> str:
+    if not isinstance(container, dict):
+        return ""
+    return " ".join(
+        str(container.get(key, "") or "").strip().lower()
+        for key in ("screen_type", "prompt", "title", "header", "body", "message", "reason", "mode")
+    )
+
+
+def _selection_operation_flags(container: object) -> dict[str, bool]:
+    text = _selection_text_blob(container)
+    return {
+        "consume": _text_has_any(text, ("exhaust", "consume", "burn", "sacrifice", "消耗", "耗尽", "枯竭", "焚烧", "献祭")),
+        "upgrade": _text_has_any(text, ("upgrade", "强化", "升级")),
+        "remove": _text_has_any(text, ("remove", "purge", "delete", "forget", "transform", "change", "replace", "mutate", "移除", "删除", "遗忘", "删牌", "变换", "变化", "替换", "变形")),
+        "enchant": _text_has_any(text, ("enchant", "imbue", "附魔", "灌注")),
+    }
+
+
+def _raw_card_consumes_on_play(raw: dict[str, object]) -> bool:
+    for key in (
+        "exhausts",
+        "exhaust",
+        "consumes",
+        "consume",
+        "purge_on_use",
+        "remove_on_use",
+        "exhausts_on_use",
+        "is_exhaust",
+        "is_exhaust_on_play",
+        "is_consumed_on_play",
+    ):
+        value = raw.get(key)
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        token = str(value or "").strip().lower()
+        if token in {"true", "yes", "1", "exhaust", "consume", "consumed"}:
+            return True
+    description = " ".join(
+        str(raw.get(key, "") or "").strip().lower()
+        for key in ("rules_text", "description", "text", "tooltip")
+    )
+    return _text_has_any(description, ("exhaust", "consume", "消耗", "耗尽", "枯竭"))
+
+
+def _normalize_keyword_tokens(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        raw = (
+            item.get("glossary_id")
+            or item.get("display_text")
+            or item.get("name")
+            or item.get("title")
+            or item.get("id")
+        )
+        token = _slugify(raw)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tuple(tokens)
 
 
 def _iter_dicts(value: object) -> list[dict[str, object]]:
@@ -164,6 +302,101 @@ def _ratio(value: object, scale: float, clamp: float = 1.0) -> float:
     return ratio
 
 
+def _signed_ratio(value: object, scale: float, clamp: float = 1.0) -> float:
+    if scale <= 0.0:
+        return 0.0
+    ratio = _to_float(value) / scale
+    if ratio < -clamp:
+        return -clamp
+    if ratio > clamp:
+        return clamp
+    return ratio
+
+
+def _normalize_map_node_type(value: object) -> str:
+    token = _slugify(value)
+    return {
+        "START": "Start",
+        "MONSTER": "Monster",
+        "ELITE": "Elite",
+        "REST_SITE": "RestSite",
+        "RESTSITE": "RestSite",
+        "SHOP": "Shop",
+        "EVENT": "Event",
+        "TREASURE": "Treasure",
+        "BOSS": "Boss",
+        "UNKNOWN": "Unknown",
+    }.get(token, "Unknown")
+
+
+def _normalize_option_type(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    node_type = _normalize_map_node_type(text)
+    if node_type != "Unknown" or _slugify(text) == "UNKNOWN":
+        return node_type
+    return text
+
+
+def _coordinate_pair(value: object) -> tuple[int, int] | None:
+    if isinstance(value, dict):
+        raw_col = value.get("col")
+        raw_row = value.get("row")
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        raw_col, raw_row = value[0], value[1]
+    else:
+        return None
+    try:
+        return int(raw_col), int(raw_row)
+    except (TypeError, ValueError):
+        return None
+
+
+def _empty_map_type_counts() -> tuple[int, ...]:
+    return tuple(0 for _ in MAP_NODE_TYPES)
+
+
+def _empty_map_depth_type_counts() -> tuple[tuple[int, ...], ...]:
+    return tuple(_empty_map_type_counts() for _ in MAP_ROUTE_DEPTH_LABELS)
+
+
+def _dominant_map_node_type(type_counts: tuple[int, ...]) -> str:
+    best_type = "Unknown"
+    best_count = 0
+    for node_type in MAP_ROUTE_TRACKED_TYPES:
+        count = type_counts[MAP_NODE_TYPE_INDEX[node_type]]
+        if count > best_count:
+            best_type = node_type
+            best_count = count
+    return best_type if best_count > 0 else "Unknown"
+
+
+def map_type_count(type_counts: tuple[int, ...], node_type: str) -> int:
+    if not type_counts:
+        return 0
+    return type_counts[MAP_NODE_TYPE_INDEX.get(node_type, MAP_NODE_TYPE_INDEX["Unknown"])]
+
+
+def map_type_ratio(type_counts: tuple[int, ...], node_type: str) -> float:
+    total = sum(type_counts)
+    if total <= 0:
+        return 0.0
+    return map_type_count(type_counts, node_type) / total
+
+
+def map_depth_type_ratio(depth_type_counts: tuple[tuple[int, ...], ...], depth: int, node_type: str) -> float:
+    if depth < 0 or depth >= len(depth_type_counts):
+        return 0.0
+    return map_type_ratio(depth_type_counts[depth], node_type)
+
+
+def map_depth_dominant_type(depth_type_counts: tuple[tuple[int, ...], ...], depth: int) -> str:
+    if depth < 0 or depth >= len(depth_type_counts):
+        return "Unknown"
+    return _dominant_map_node_type(depth_type_counts[depth])
+
+
 def _safe_div(numerator: object, denominator: object) -> float:
     bottom = _to_float(denominator)
     if bottom == 0.0:
@@ -185,9 +418,158 @@ def _match_token(value: object, allowed: set[str]) -> bool:
     return _slugify(value) in allowed
 
 
+def _hand_card_type_rank(card_type: str) -> int:
+    return {
+        "Power": 5,
+        "Attack": 4,
+        "Skill": 3,
+        "Status": 2,
+        "Curse": 1,
+    }.get(card_type, 0)
+
+
+def _hand_card_target_rank(card: SemanticCard) -> int:
+    if _match_token(card.target_type, ALL_ENEMY_TARGET_TYPES):
+        return 3
+    if _match_token(card.target_type, ENEMY_TARGET_TYPES):
+        return 2
+    if _match_token(card.target_type, SELF_TARGET_TYPES) and card.card_type != "Attack":
+        return 1
+    return 0
+
+
+def _hand_card_priority(card: SemanticCard, state: SemanticState) -> float:
+    score = 0.0
+    living_enemy_count = len(state.living_enemies)
+    incoming_damage = max(0.0, state.incoming_damage)
+    block_gap = max(0.0, state.incoming_damage - state.player_block)
+    block_surplus = max(0.0, state.player_block - state.incoming_damage)
+    cost_units = _cost_units(card.cost, state.player_energy)
+    hp_ratio = state.player_hp / max(state.player_max_hp, 1.0)
+    is_self_non_attack = _match_token(card.target_type, SELF_TARGET_TYPES) and card.card_type != "Attack"
+    is_attack = card.card_type == "Attack"
+    if card.card_type == "Power":
+        score += 4.25
+    elif card.card_type == "Skill":
+        score += 0.75
+    elif card.card_type == "Attack":
+        score += 1.25
+    elif card.card_type == "Status":
+        score -= 3.5
+    elif card.card_type == "Curse":
+        score -= 4.0
+    if is_self_non_attack:
+        score += 0.25
+    if _match_token(card.target_type, ALL_ENEMY_TARGET_TYPES) and living_enemy_count > 1:
+        score += 0.75
+    if block_gap > 0.0:
+        if is_self_non_attack:
+            defensive_urgency = block_gap / max(10.0, state.player_max_hp * 0.18)
+            if hp_ratio < 0.35:
+                defensive_urgency += 0.15
+            score += min(1.35, 0.35 + defensive_urgency)
+        elif is_attack:
+            score -= 0.20
+    elif is_self_non_attack:
+        if incoming_damage <= 0.0:
+            score -= 1.00
+        elif block_surplus > 0.0:
+            score -= min(0.90, 0.20 + (block_surplus / max(12.0, state.player_max_hp * 0.20)))
+    if incoming_damage <= 0.0 and is_attack:
+        score += 0.35
+    if cost_units >= 2.0:
+        score += 0.50
+    elif cost_units == 0.0 and card.can_play:
+        score += 0.25
+    if card.is_upgraded:
+        score += 0.35
+    score += min(1.2, len(card.enchantments) * 0.35)
+    score -= min(1.8, len(card.afflictions) * 0.6)
+    if not card.can_play:
+        score -= 6.0
+    return score
+
+
+def _hand_card_sort_key(card: SemanticCard, state: SemanticState) -> tuple[float, int, int, int, float, int]:
+    priority = _hand_card_priority(card, state)
+    return (
+        priority,
+        _hand_card_type_rank(card.card_type),
+        _hand_card_target_rank(card),
+        1 if card.is_upgraded else 0,
+        _cost_units(card.cost, state.player_energy),
+        -card.index,
+    )
+
+
+def build_hand_order_profile(state: dict[str, object] | SemanticState) -> HandOrderProfile:
+    semantic_state = ensure_semantic_state(state)
+    hand_by_index = {
+        card.index: card
+        for card in semantic_state.hand
+        if 0 <= card.index < HAND_SLOT_COUNT
+    }
+    slot_present = [False] * HAND_SLOT_COUNT
+    slot_priorities = [0.0] * HAND_SLOT_COUNT
+    slot_before_counts = [0] * HAND_SLOT_COUNT
+    slot_after_counts = [0] * HAND_SLOT_COUNT
+    pair_prefer_before = [[False] * HAND_SLOT_COUNT for _ in range(HAND_SLOT_COUNT)]
+    for slot_index, card in hand_by_index.items():
+        slot_present[slot_index] = True
+        slot_priorities[slot_index] = _hand_card_priority(card, semantic_state)
+    ordered_slots = sorted(hand_by_index)
+    for left_index in ordered_slots:
+        left_card = hand_by_index[left_index]
+        left_key = _hand_card_sort_key(left_card, semantic_state)
+        for right_index in ordered_slots:
+            if left_index >= right_index:
+                continue
+            right_card = hand_by_index[right_index]
+            right_key = _hand_card_sort_key(right_card, semantic_state)
+            if left_key > right_key:
+                earlier_index, later_index = left_index, right_index
+            else:
+                earlier_index, later_index = right_index, left_index
+            pair_prefer_before[earlier_index][later_index] = True
+            slot_before_counts[earlier_index] += 1
+            slot_after_counts[later_index] += 1
+    return HandOrderProfile(
+        slot_present=tuple(slot_present),
+        slot_priorities=tuple(slot_priorities),
+        slot_before_counts=tuple(slot_before_counts),
+        slot_after_counts=tuple(slot_after_counts),
+        pair_prefer_before=tuple(tuple(row) for row in pair_prefer_before),
+    )
+
+
+def build_hand_order_action_biases(
+    state: dict[str, object] | SemanticState,
+    profile: HandOrderProfile | None = None,
+) -> dict[int, float]:
+    semantic_state = ensure_semantic_state(state)
+    hand_profile = profile or build_hand_order_profile(semantic_state)
+    available_slots = hand_profile.available_slots
+    if not available_slots:
+        return {}
+    denominator = max(len(available_slots) - 1, 1)
+    biases: dict[int, float] = {}
+    for slot_index in available_slots:
+        relation_balance = (hand_profile.slot_before_counts[slot_index] - hand_profile.slot_after_counts[slot_index]) / denominator
+        priority_component = _signed_ratio(hand_profile.slot_priorities[slot_index], HAND_ORDER_PRIORITY_SCALE, 1.0)
+        biases[slot_index] = max(-2.0, min(2.0, relation_balance * 1.25 + priority_component * 0.75))
+    return biases
+
+
 def _intent_damage_from_label(label: object) -> float:
     digits = "".join(character for character in str(label) if character.isdigit())
     return float(digits) if digits else 0.0
+
+
+def combat_round_bucket(value: object) -> str:
+    round_value = max(0, _to_int(value))
+    if round_value >= 11:
+        return COMBAT_ROUND_BUCKETS[-1]
+    return COMBAT_ROUND_BUCKETS[min(round_value, len(COMBAT_ROUND_BUCKETS) - 2)]
 
 
 def _default_catalog_candidates() -> list[Path]:
@@ -266,6 +648,7 @@ class SemanticCard:
     cost: str = ""
     target_type: str = ""
     can_play: bool = False
+    consumes_on_play: bool = False
     is_upgraded: bool = False
     enchantments: tuple[SemanticEnchantment, ...] = ()
     afflictions: tuple[SemanticAffliction, ...] = ()
@@ -317,9 +700,12 @@ class SemanticRewardItem:
 
 @dataclass(frozen=True)
 class SemanticShopItem:
+    index: int = -1
     category: str = ""
     can_afford: bool = False
     is_stocked: bool = True
+    price: float = 0.0
+    item_token: str = ""
     card_id: str = ""
     relic_id: str = ""
     potion_id: str = ""
@@ -336,8 +722,31 @@ class SemanticOption:
     is_locked: bool = False
     is_proceed: bool = False
     is_enabled: bool = False
+    was_chosen: bool = False
     relic_id: str = ""
+    card_id: str = ""
+    potion_id: str = ""
     option_type: str = ""
+    title: str = ""
+    description: str = ""
+    keyword_tokens: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticMapRoute:
+    option_index: int = -1
+    col: int = 0
+    row: int = 0
+    option_type: str = "Unknown"
+    reachable_count: int = 0
+    path_count: int = 0
+    max_depth: int = 0
+    boss_distance: int = -1
+    route_score: float = 0.0
+    dominant_type: str = "Unknown"
+    depth_dominant_types: tuple[str, ...] = ()
+    type_counts: tuple[int, ...] = ()
+    depth_type_counts: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -377,13 +786,25 @@ class SemanticState:
     card_reward_cards: tuple[SemanticCard, ...] = ()
     card_reward_can_skip: bool = False
     map_options: tuple[SemanticOption, ...] = ()
+    map_current_row: int = 0
+    map_remaining_node_count: int = 0
+    map_remaining_boss_distance: int = -1
+    map_remaining_dominant_type: str = "Unknown"
+    map_remaining_type_counts: tuple[int, ...] = ()
+    map_remaining_depth_type_counts: tuple[tuple[int, ...], ...] = ()
+    map_route_summaries: tuple[SemanticMapRoute, ...] = ()
     event_id: str = ""
+    event_name: str = ""
     event_in_dialogue: bool = False
     event_options: tuple[SemanticOption, ...] = ()
     rest_options: tuple[SemanticOption, ...] = ()
     rest_can_proceed: bool = False
     card_select_cards: tuple[SemanticCard, ...] = ()
     card_select_preview_cards: tuple[SemanticCard, ...] = ()
+    card_select_is_consume: bool = False
+    card_select_is_upgrade: bool = False
+    card_select_is_remove: bool = False
+    card_select_is_enchant: bool = False
     card_select_can_confirm: bool = False
     card_select_can_cancel: bool = False
     bundle_cards: tuple[SemanticCard, ...] = ()
@@ -393,6 +814,10 @@ class SemanticState:
     bundle_can_cancel: bool = False
     hand_select_cards: tuple[SemanticCard, ...] = ()
     hand_select_selected_cards: tuple[SemanticCard, ...] = ()
+    hand_select_is_consume: bool = False
+    hand_select_is_upgrade: bool = False
+    hand_select_is_remove: bool = False
+    hand_select_is_enchant: bool = False
     hand_select_can_confirm: bool = False
     relic_select_relics: tuple[SemanticRelic, ...] = ()
     relic_select_can_skip: bool = False
@@ -444,6 +869,25 @@ class SemanticObservation:
     vector: list[float]
 
 
+EMPTY_HAND_SLOT_PRESENT = tuple(False for _ in range(HAND_SLOT_COUNT))
+EMPTY_HAND_SLOT_FLOATS = tuple(0.0 for _ in range(HAND_SLOT_COUNT))
+EMPTY_HAND_SLOT_INTS = tuple(0 for _ in range(HAND_SLOT_COUNT))
+EMPTY_HAND_SLOT_MATRIX = tuple(tuple(False for _ in range(HAND_SLOT_COUNT)) for _ in range(HAND_SLOT_COUNT))
+
+
+@dataclass(frozen=True)
+class HandOrderProfile:
+    slot_present: tuple[bool, ...] = EMPTY_HAND_SLOT_PRESENT
+    slot_priorities: tuple[float, ...] = EMPTY_HAND_SLOT_FLOATS
+    slot_before_counts: tuple[int, ...] = EMPTY_HAND_SLOT_INTS
+    slot_after_counts: tuple[int, ...] = EMPTY_HAND_SLOT_INTS
+    pair_prefer_before: tuple[tuple[bool, ...], ...] = EMPTY_HAND_SLOT_MATRIX
+
+    @property
+    def available_slots(self) -> tuple[int, ...]:
+        return tuple(index for index, present in enumerate(self.slot_present) if present)
+
+
 class _FeatureBuilder:
     def __init__(self) -> None:
         self.names: list[str] = []
@@ -469,6 +913,9 @@ class SemanticHistoryTracker:
         self.last_turn_skipped_unspent = False
         self.last_enemy_hp_progress = 0.0
         self.last_player_hp_loss = 0.0
+        self.last_hand_order_refresh = False
+        self.last_hand_order_refresh_turn_start = False
+        self.last_hand_order_refresh_hand_changed = False
         self.turn_step_count = 0
         self.turn_cards_played = 0
         self.turn_attack_cards = 0
@@ -479,6 +926,7 @@ class SemanticHistoryTracker:
         self.turn_energy_spent = 0.0
         self.turn_enemy_damage = 0.0
         self.turn_player_damage = 0.0
+        self.turn_hand_order_refreshes = 0
         self.combat_step_count = 0
         self.combat_cards_played = 0
         self.combat_potions_used = 0
@@ -490,6 +938,8 @@ class SemanticHistoryTracker:
         self._run_progress: tuple[int, int] | None = None
         self._combat_anchor: tuple[int, int, str] | None = None
         self._current_turn_round: int | None = None
+        self._hand_order_signature: tuple[object, ...] | None = None
+        self._hand_order_profile = HandOrderProfile()
         self._awaiting_run_reset = False
 
     def _clear_transients(self) -> None:
@@ -502,6 +952,9 @@ class SemanticHistoryTracker:
         self.last_turn_skipped_unspent = False
         self.last_enemy_hp_progress = 0.0
         self.last_player_hp_loss = 0.0
+        self.last_hand_order_refresh = False
+        self.last_hand_order_refresh_turn_start = False
+        self.last_hand_order_refresh_hand_changed = False
 
     def _reset_turn_progress(self) -> None:
         self.turn_step_count = 0
@@ -514,6 +967,7 @@ class SemanticHistoryTracker:
         self.turn_energy_spent = 0.0
         self.turn_enemy_damage = 0.0
         self.turn_player_damage = 0.0
+        self.turn_hand_order_refreshes = 0
 
     def _reset_combat_progress(self) -> None:
         self._reset_turn_progress()
@@ -527,9 +981,57 @@ class SemanticHistoryTracker:
         self.combat_player_damage = 0.0
         self._combat_anchor = None
         self._current_turn_round = None
+        self._hand_order_signature = None
+        self._hand_order_profile = HandOrderProfile()
+
+    @property
+    def hand_order_profile(self) -> HandOrderProfile:
+        return self._hand_order_profile
+
+    def _hand_order_state_signature(self, state: SemanticState) -> tuple[object, ...] | None:
+        if not state.in_combat or not state.is_player_turn:
+            return None
+        return (
+            state.act,
+            state.floor,
+            state.encounter_id,
+            state.battle_round,
+            tuple(
+                (
+                    card.index,
+                    card.id,
+                    card.card_type,
+                    card.cost,
+                    card.target_type,
+                    card.can_play,
+                    card.consumes_on_play,
+                    card.is_upgraded,
+                    len(card.enchantments),
+                    len(card.afflictions),
+                )
+                for card in state.hand
+                if 0 <= card.index < HAND_SLOT_COUNT
+            ),
+        )
+
+    def _sync_hand_order_profile(self, state: SemanticState, *, turn_started: bool) -> None:
+        signature = self._hand_order_state_signature(state)
+        if signature is None:
+            self._hand_order_signature = None
+            self._hand_order_profile = HandOrderProfile()
+            return
+        if self._hand_order_signature == signature:
+            return
+        self._hand_order_signature = signature
+        self._hand_order_profile = build_hand_order_profile(state)
+        self.last_hand_order_refresh = True
+        self.last_hand_order_refresh_turn_start = turn_started
+        self.last_hand_order_refresh_hand_changed = not turn_started
+        self.turn_hand_order_refreshes += 1
 
     def sync_state(self, state: dict[str, object] | SemanticState) -> SemanticState:
         semantic_state = ensure_semantic_state(state)
+        turn_started = False
         if semantic_state.state_type not in TERMINAL_STATE_TYPES:
             if self._awaiting_run_reset:
                 self.reset()
@@ -548,13 +1050,20 @@ class SemanticHistoryTracker:
             if self._combat_anchor is None:
                 self._combat_anchor = combat_anchor
                 self._current_turn_round = semantic_state.battle_round
+                turn_started = semantic_state.is_player_turn
             elif self._combat_anchor != combat_anchor:
                 self._reset_combat_progress()
                 self._combat_anchor = combat_anchor
                 self._current_turn_round = semantic_state.battle_round
+                turn_started = semantic_state.is_player_turn
             elif semantic_state.is_player_turn and self._current_turn_round != semantic_state.battle_round:
                 self._reset_turn_progress()
                 self._current_turn_round = semantic_state.battle_round
+                turn_started = True
+        else:
+            self._hand_order_signature = None
+            self._hand_order_profile = HandOrderProfile()
+        self._sync_hand_order_profile(semantic_state, turn_started=turn_started)
         return semantic_state
 
     def update_from_transition(
@@ -657,16 +1166,118 @@ def load_semantic_catalog(path: str | Path | None = None) -> SemanticCatalog:
         for group in ENTITY_GROUPS:
             for item in _iter_dicts(entities.get(group)):
                 add(str(item.get("model_id", "")))
+                if group == "encounters":
+                    encounter_model = str(item.get("model_id", "") or item.get("entry", ""))
+                    encounter_token = encounter_model.split(".")[-1]
+                    for round_bucket in COMBAT_ROUND_BUCKETS:
+                        if encounter_token:
+                            add(f"ENCOUNTER_ROUND.{encounter_token}.{round_bucket}")
                 if group == "monsters":
-                    monster_token = _normalize_model_token(item.get("entry") or item.get("model_id", "")).split(".")[-1]
+                    monster_model = str(item.get("entry") or item.get("model_id", ""))
+                    monster_token = monster_model.split(".")[-1]
+                    for round_bucket in COMBAT_ROUND_BUCKETS:
+                        if monster_token:
+                            add(f"MONSTER_ROUND.{monster_token}.{round_bucket}")
                     for move_id in item.get("move_ids", []):
-                        move_token = _normalize_model_token(move_id)
+                        move_token = str(move_id)
                         if monster_token and move_token:
                             add(f"MONSTER_MOVE.{monster_token}.{move_token}")
+                            for round_bucket in COMBAT_ROUND_BUCKETS:
+                                add(f"MONSTER_MOVE_ROUND.{monster_token}.{move_token}.{round_bucket}")
 
         for category, values in RUNTIME_CONCEPTS.items():
             for value in values:
                 add(f"{category}.{_slugify(value)}")
+
+        for slot_index in range(SHOP_SLOT_COUNT):
+            slot_token = f"SLOT_{slot_index}"
+            for category in SHOP_SLOT_CATEGORIES:
+                add(f"SHOP_SLOT_CATEGORY.{slot_token}.{category}")
+            add(f"SHOP_SLOT_ITEM.{slot_token}.SPECIAL.CARD_REMOVAL")
+            add(f"SHOP_SLOT_ITEM.{slot_token}.SPECIAL.UNKNOWN")
+            for item in _iter_dicts(entities.get("cards")):
+                model_id = str(item.get("model_id", ""))
+                if model_id:
+                    add(f"SHOP_SLOT_ITEM.{slot_token}.{model_id}")
+            for item in _iter_dicts(entities.get("relics")):
+                model_id = str(item.get("model_id", ""))
+                if model_id:
+                    add(f"SHOP_SLOT_ITEM.{slot_token}.{model_id}")
+            for item in _iter_dicts(entities.get("potions")):
+                model_id = str(item.get("model_id", ""))
+                if model_id:
+                    add(f"SHOP_SLOT_ITEM.{slot_token}.{model_id}")
+
+        for group in ("events", "ancients"):
+            for item in _iter_dicts(entities.get(group)):
+                event_token = _normalize_model_token(item.get("model_id"))
+                if not event_token:
+                    continue
+                event_token = event_token.split(".")[-1]
+                for option_index in range(EVENT_OPTION_COUNT):
+                    add(f"EVENT_OPTION_SLOT.{event_token}.OPTION_{option_index}")
+        for option_index in range(EVENT_OPTION_COUNT):
+            option_token = f"OPTION_{option_index}"
+            for kind in EVENT_OPTION_KINDS:
+                add(f"EVENT_OPTION_KIND.{option_token}.{kind}")
+            add(f"EVENT_OPTION_RELIC.{option_token}.SPECIAL.UNKNOWN")
+            add(f"EVENT_OPTION_CARD.{option_token}.SPECIAL.UNKNOWN")
+            add(f"EVENT_OPTION_POTION.{option_token}.SPECIAL.UNKNOWN")
+            for item in _iter_dicts(entities.get("cards")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"EVENT_OPTION_CARD.{option_token}.{model_id.split('.')[-1]}")
+            for item in _iter_dicts(entities.get("relics")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"EVENT_OPTION_RELIC.{option_token}.{model_id.split('.')[-1]}")
+            for item in _iter_dicts(entities.get("potions")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"EVENT_OPTION_POTION.{option_token}.{model_id.split('.')[-1]}")
+
+        for slot_index in range(HAND_SLOT_COUNT):
+            slot_token = f"SLOT_{slot_index}"
+            add(f"HAND_SLOT_CARD.{slot_token}.SPECIAL.UNKNOWN")
+            for item in _iter_dicts(entities.get("cards")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"HAND_SLOT_CARD.{slot_token}.{model_id.split('.')[-1]}")
+
+        for slot_index in range(CARD_SELECT_SLOT_COUNT):
+            slot_token = f"SLOT_{slot_index}"
+            add(f"CARD_SELECT_SLOT_CARD.{slot_token}.SPECIAL.UNKNOWN")
+            for operation in CARD_OPERATION_KINDS:
+                add(f"CARD_SELECT_SLOT_OPERATION.{slot_token}.{operation}")
+            for item in _iter_dicts(entities.get("cards")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"CARD_SELECT_SLOT_CARD.{slot_token}.{model_id.split('.')[-1]}")
+
+        for slot_index in range(HAND_SELECT_SLOT_COUNT):
+            slot_token = f"SLOT_{slot_index}"
+            add(f"HAND_SELECT_SELECTED.{slot_token}")
+            add(f"HAND_SELECT_SLOT_CARD.{slot_token}.SPECIAL.UNKNOWN")
+            for operation in CARD_OPERATION_KINDS:
+                add(f"HAND_SELECT_SLOT_OPERATION.{slot_token}.{operation}")
+            for item in _iter_dicts(entities.get("cards")):
+                model_id = _normalize_model_token(item.get("model_id"))
+                if model_id:
+                    add(f"HAND_SELECT_SLOT_CARD.{slot_token}.{model_id.split('.')[-1]}")
+
+        for node_type in MAP_NODE_TYPES:
+            add(f"MAP_REMAINING_DOMINANT.{node_type}")
+            add(f"MAP_REMAINING_HAS.{node_type}")
+            for depth_label in MAP_ROUTE_DEPTH_LABELS:
+                add(f"MAP_REMAINING_DEPTH.{depth_label}.{node_type}")
+        for option_index in range(MAP_ROUTE_OPTION_COUNT):
+            option_token = f"OPTION_{option_index}"
+            for node_type in MAP_NODE_TYPES:
+                add(f"MAP_OPTION_TYPE.{option_token}.{node_type}")
+                add(f"MAP_ROUTE_DOMINANT.{option_token}.{node_type}")
+                add(f"MAP_ROUTE_HAS.{option_token}.{node_type}")
+                for depth_label in MAP_ROUTE_DEPTH_LABELS:
+                    add(f"MAP_ROUTE_DEPTH.{option_token}.{depth_label}.{node_type}")
 
         concept_keys = tuple(keys)
         concept_index = {key: index for index, key in enumerate(concept_keys)}
@@ -713,6 +1324,7 @@ def _normalize_card(raw: dict[str, object]) -> SemanticCard:
         cost=str(raw.get("cost", "")),
         target_type=str(raw.get("target_type", "") or "None"),
         can_play=bool(raw.get("can_play")),
+        consumes_on_play=_raw_card_consumes_on_play(raw),
         is_upgraded=bool(raw.get("is_upgraded")),
         enchantments=tuple(_normalize_enchantment(item) for item in _list_at(raw, "enchantments")),
         afflictions=tuple(_normalize_affliction(item) for item in _list_at(raw, "afflictions")),
@@ -775,11 +1387,32 @@ def _normalize_reward_item(raw: dict[str, object]) -> SemanticRewardItem:
     )
 
 
+def _shop_item_token(raw: dict[str, object]) -> str:
+    category = _slugify(raw.get("category"))
+    if category == "CARD":
+        token = _normalize_model_token(raw.get("card_id"))
+        return f"CARD.{token}" if token else "CARD.UNKNOWN"
+    if category == "RELIC":
+        token = _normalize_model_token(raw.get("relic_id"))
+        return f"RELIC.{token}" if token else "RELIC.UNKNOWN"
+    if category == "POTION":
+        token = _normalize_model_token(raw.get("potion_id"))
+        return f"POTION.{token}" if token else "POTION.UNKNOWN"
+    if category == "CARD_REMOVAL":
+        return "SPECIAL.CARD_REMOVAL"
+    if category:
+        return f"SPECIAL.{category}"
+    return "SPECIAL.UNKNOWN"
+
+
 def _normalize_shop_item(raw: dict[str, object]) -> SemanticShopItem:
     return SemanticShopItem(
+        index=_to_int(raw.get("index", -1)),
         category=str(raw.get("category", "")),
         can_afford=bool(raw.get("can_afford")),
         is_stocked=bool(raw.get("is_stocked", True)),
+        price=_to_float(raw.get("price")),
+        item_token=_shop_item_token(raw),
         card_id=_normalize_model_token(raw.get("card_id")),
         relic_id=_normalize_model_token(raw.get("relic_id")),
         potion_id=_normalize_model_token(raw.get("potion_id")),
@@ -797,9 +1430,269 @@ def _normalize_option(raw: dict[str, object]) -> SemanticOption:
         is_locked=bool(raw.get("is_locked")),
         is_proceed=bool(raw.get("is_proceed")),
         is_enabled=bool(raw.get("is_enabled", True)),
+        was_chosen=bool(raw.get("was_chosen")),
         relic_id=_normalize_model_token(raw.get("relic_id")),
-        option_type=str(raw.get("type", raw.get("option_type", ""))),
+        card_id=_normalize_model_token(raw.get("card_id")),
+        potion_id=_normalize_model_token(raw.get("potion_id")),
+        option_type=_normalize_option_type(raw.get("type", raw.get("option_type", ""))),
+        title=_clean_text(raw.get("title") or raw.get("name") or raw.get("label")),
+        description=_clean_text(raw.get("description") or raw.get("body")),
+        keyword_tokens=_normalize_keyword_tokens(raw.get("keywords")),
     )
+
+
+def event_option_kind(option: SemanticOption | None) -> str:
+    if option is None or option.index < 0:
+        return "NONE"
+    if option.is_proceed:
+        return "PROCEED"
+    if option.relic_id:
+        return "RELIC"
+    if option.card_id:
+        return "CARD"
+    if option.potion_id:
+        return "POTION"
+    if option.keyword_tokens:
+        return "KEYWORD"
+    if option.title or option.description:
+        return "TEXT"
+    return "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class _MapNodeRecord:
+    col: int
+    row: int
+    node_type: str
+    children: tuple[tuple[int, int], ...]
+
+
+def _map_current_row(map_state: dict[str, object]) -> int:
+    current_position = _dict_at(map_state, "current_position")
+    if "row" in current_position:
+        return _to_int(current_position.get("row"))
+    visited = _list_at(map_state, "visited")
+    if visited:
+        return max(_to_int(item.get("row")) for item in visited)
+    return 0
+
+
+def _build_map_node_lookup(map_state: dict[str, object]) -> tuple[dict[tuple[int, int], _MapNodeRecord], tuple[int, int] | None]:
+    node_lookup: dict[tuple[int, int], _MapNodeRecord] = {}
+    boss_key = _coordinate_pair(_dict_at(map_state, "boss"))
+
+    for raw_node in _list_at(map_state, "nodes"):
+        key = _coordinate_pair(raw_node)
+        if key is None:
+            continue
+        children = tuple(
+            child
+            for child in (_coordinate_pair(item) for item in raw_node.get("children", []) if isinstance(raw_node.get("children"), list))
+            if child is not None
+        )
+        node_type = _normalize_map_node_type(raw_node.get("type"))
+        if boss_key is not None and key == boss_key:
+            node_type = "Boss"
+        node_lookup[key] = _MapNodeRecord(key[0], key[1], node_type, children)
+
+    for raw_option in _list_at(map_state, "next_options"):
+        key = _coordinate_pair(raw_option)
+        if key is None:
+            continue
+        option_children = tuple(
+            child
+            for child in (
+                _coordinate_pair(item)
+                for item in raw_option.get("leads_to", [])
+                if isinstance(raw_option.get("leads_to"), list)
+            )
+            if child is not None
+        )
+        option_type = _normalize_map_node_type(raw_option.get("type"))
+        existing = node_lookup.get(key)
+        if existing is None:
+            node_lookup[key] = _MapNodeRecord(key[0], key[1], option_type, option_children)
+        else:
+            merged_type = existing.node_type if existing.node_type != "Unknown" else option_type
+            merged_children = existing.children or option_children
+            node_lookup[key] = _MapNodeRecord(key[0], key[1], merged_type, merged_children)
+
+    if boss_key is not None and boss_key not in node_lookup:
+        node_lookup[boss_key] = _MapNodeRecord(boss_key[0], boss_key[1], "Boss", ())
+
+    return node_lookup, boss_key
+
+
+def _count_map_paths(
+    start_key: tuple[int, int],
+    node_lookup: dict[tuple[int, int], _MapNodeRecord],
+    memo: dict[tuple[int, int], int],
+) -> int:
+    cached = memo.get(start_key)
+    if cached is not None:
+        return cached
+    record = node_lookup.get(start_key)
+    if record is None:
+        memo[start_key] = 0
+        return 0
+    children = tuple(child for child in record.children if child in node_lookup)
+    if not children:
+        memo[start_key] = 1
+        return 1
+    total = 0
+    for child in children:
+        total += _count_map_paths(child, node_lookup, memo)
+        if total >= 999:
+            total = 999
+            break
+    memo[start_key] = total
+    return total
+
+
+def _map_shortest_depths(
+    start_keys: tuple[tuple[int, int], ...],
+    node_lookup: dict[tuple[int, int], _MapNodeRecord],
+) -> dict[tuple[int, int], int]:
+    pending = [(key, 0) for key in start_keys if key in node_lookup]
+    depths: dict[tuple[int, int], int] = {}
+    while pending:
+        key, depth = pending.pop(0)
+        if key in depths and depth >= depths[key]:
+            continue
+        depths[key] = depth
+        record = node_lookup.get(key)
+        if record is None:
+            continue
+        for child in record.children:
+            if child not in node_lookup:
+                continue
+            pending.append((child, depth + 1))
+    return depths
+
+
+def _depth_dominant_types(depth_type_counts: tuple[tuple[int, ...], ...]) -> tuple[str, ...]:
+    return tuple(_dominant_map_node_type(type_counts) for type_counts in depth_type_counts)
+
+
+def _route_node_weight(node_type: str, depth: int) -> float:
+    weight = MAP_ROUTE_SCORE_WEIGHTS.get(node_type, 0.0)
+    if node_type == "Monster":
+        if depth >= 3:
+            weight -= 0.45
+        elif depth >= 2:
+            weight -= 0.25
+        elif depth == 1:
+            weight -= 0.10
+    elif node_type == "Elite":
+        if depth == 0:
+            weight -= 0.40
+        elif depth == 1:
+            weight -= 0.20
+    elif node_type == "RestSite" and depth <= 1:
+        weight += 0.10
+    elif node_type == "Shop" and depth <= 1:
+        weight += 0.05
+    elif node_type == "Event" and depth <= 2:
+        weight += 0.05
+    return weight
+
+
+def _route_score_from_depths(
+    depths: dict[tuple[int, int], int],
+    node_lookup: dict[tuple[int, int], _MapNodeRecord],
+    path_count: int,
+    boss_distance: int,
+) -> float:
+    score = 0.0
+    for key, depth in depths.items():
+        node_type = node_lookup.get(key, _MapNodeRecord(0, 0, "Unknown", ())).node_type
+        score += _route_node_weight(node_type, depth) / (1.0 + (depth * 0.45))
+    score += min(1.0, max(0, path_count - 1) * 0.04)
+    if boss_distance >= 0:
+        score += 0.60 / (1.0 + boss_distance)
+    return score
+
+
+def _summarize_map_route(
+    raw_option: dict[str, object],
+    node_lookup: dict[tuple[int, int], _MapNodeRecord],
+    boss_key: tuple[int, int] | None,
+) -> SemanticMapRoute:
+    option_index = _to_int(raw_option.get("index", -1))
+    start_key = _coordinate_pair(raw_option)
+    option_type = _normalize_map_node_type(raw_option.get("type"))
+    if start_key is None or start_key not in node_lookup:
+        return SemanticMapRoute(
+            option_index=option_index,
+            option_type=option_type,
+            type_counts=_empty_map_type_counts(),
+            depth_type_counts=_empty_map_depth_type_counts(),
+            depth_dominant_types=tuple("Unknown" for _ in MAP_ROUTE_DEPTH_LABELS),
+        )
+    depths = _map_shortest_depths((start_key,), node_lookup)
+    type_counts = [0 for _ in MAP_NODE_TYPES]
+    depth_type_counts = [[0 for _ in MAP_NODE_TYPES] for _ in MAP_ROUTE_DEPTH_LABELS]
+    max_depth = 0
+    for key, depth in depths.items():
+        record = node_lookup[key]
+        type_index = MAP_NODE_TYPE_INDEX.get(record.node_type, MAP_NODE_TYPE_INDEX["Unknown"])
+        type_counts[type_index] += 1
+        if depth <= MAP_ROUTE_DEPTH_LIMIT:
+            depth_type_counts[depth][type_index] += 1
+        if depth > max_depth:
+            max_depth = depth
+    boss_distance = depths.get(
+        boss_key,
+        min((depth for key, depth in depths.items() if node_lookup[key].node_type == "Boss"), default=-1),
+    )
+    path_count = _count_map_paths(start_key, node_lookup, {})
+    frozen_type_counts = tuple(type_counts)
+    frozen_depth_counts = tuple(tuple(counts) for counts in depth_type_counts)
+    return SemanticMapRoute(
+        option_index=option_index,
+        col=start_key[0],
+        row=start_key[1],
+        option_type=node_lookup[start_key].node_type if node_lookup[start_key].node_type != "Unknown" else option_type,
+        reachable_count=len(depths),
+        path_count=path_count,
+        max_depth=max_depth,
+        boss_distance=boss_distance,
+        route_score=_route_score_from_depths(depths, node_lookup, path_count, boss_distance),
+        dominant_type=_dominant_map_node_type(frozen_type_counts),
+        depth_dominant_types=_depth_dominant_types(frozen_depth_counts),
+        type_counts=frozen_type_counts,
+        depth_type_counts=frozen_depth_counts,
+    )
+
+
+def _summarize_map_overview(
+    next_options: list[dict[str, object]],
+    node_lookup: dict[tuple[int, int], _MapNodeRecord],
+    boss_key: tuple[int, int] | None,
+) -> tuple[int, int, str, tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    start_keys = tuple(
+        key
+        for key in (_coordinate_pair(option) for option in next_options)
+        if key is not None and key in node_lookup
+    )
+    if not start_keys:
+        return 0, -1, "Unknown", _empty_map_type_counts(), _empty_map_depth_type_counts()
+    depths = _map_shortest_depths(start_keys, node_lookup)
+    type_counts = [0 for _ in MAP_NODE_TYPES]
+    depth_type_counts = [[0 for _ in MAP_NODE_TYPES] for _ in MAP_ROUTE_DEPTH_LABELS]
+    for key, depth in depths.items():
+        record = node_lookup[key]
+        type_index = MAP_NODE_TYPE_INDEX.get(record.node_type, MAP_NODE_TYPE_INDEX["Unknown"])
+        type_counts[type_index] += 1
+        if depth <= MAP_ROUTE_DEPTH_LIMIT:
+            depth_type_counts[depth][type_index] += 1
+    frozen_type_counts = tuple(type_counts)
+    frozen_depth_counts = tuple(tuple(counts) for counts in depth_type_counts)
+    boss_distance = depths.get(
+        boss_key,
+        min((depth for key, depth in depths.items() if node_lookup[key].node_type == "Boss"), default=-1),
+    )
+    return len(depths), boss_distance, _dominant_map_node_type(frozen_type_counts), frozen_type_counts, frozen_depth_counts
 
 
 def _flatten_bundle_cards(bundle_select: dict[str, object]) -> tuple[SemanticCard, ...]:
@@ -833,6 +1726,19 @@ def normalize_semantic_state(state: dict[str, object]) -> SemanticState:
     discard_pile = tuple(_normalize_card(card) for card in _list_at(player, "discard_pile"))
     exhaust_pile = tuple(_normalize_card(card) for card in _list_at(player, "exhaust_pile"))
     event_id = _normalize_model_token(event_state.get("event_id") or fake_merchant.get("event_id"))
+    event_name = _clean_text(event_state.get("event_name") or fake_merchant.get("event_name"))
+    raw_map_options = _list_at(map_state, "next_options")
+    map_node_lookup, boss_key = _build_map_node_lookup(map_state)
+    map_route_summaries = tuple(_summarize_map_route(option, map_node_lookup, boss_key) for option in raw_map_options)
+    card_select_ops = _selection_operation_flags(card_select)
+    hand_select_ops = _selection_operation_flags(hand_select)
+    (
+        map_remaining_node_count,
+        map_remaining_boss_distance,
+        map_remaining_dominant_type,
+        map_remaining_type_counts,
+        map_remaining_depth_type_counts,
+    ) = _summarize_map_overview(raw_map_options, map_node_lookup, boss_key)
 
     return SemanticState(
         state_type=state_type,
@@ -869,14 +1775,26 @@ def normalize_semantic_state(state: dict[str, object]) -> SemanticState:
         rewards_can_proceed=bool(rewards.get("can_proceed")),
         card_reward_cards=tuple(_normalize_card(card) for card in _list_at(card_reward, "cards")),
         card_reward_can_skip=bool(card_reward.get("can_skip")),
-        map_options=tuple(_normalize_option(option) for option in _list_at(map_state, "next_options")),
+        map_options=tuple(_normalize_option(option) for option in raw_map_options),
+        map_current_row=_map_current_row(map_state),
+        map_remaining_node_count=map_remaining_node_count,
+        map_remaining_boss_distance=map_remaining_boss_distance,
+        map_remaining_dominant_type=map_remaining_dominant_type,
+        map_remaining_type_counts=map_remaining_type_counts,
+        map_remaining_depth_type_counts=map_remaining_depth_type_counts,
+        map_route_summaries=map_route_summaries,
         event_id=event_id,
+        event_name=event_name,
         event_in_dialogue=bool(event_state.get("in_dialogue")),
         event_options=tuple(_normalize_option(option) for option in _list_at(event_state, "options")),
         rest_options=tuple(_normalize_option(option) for option in _list_at(rest_state, "options")),
         rest_can_proceed=bool(rest_state.get("can_proceed")),
         card_select_cards=tuple(_normalize_card(card) for card in _list_at(card_select, "cards")),
         card_select_preview_cards=tuple(_normalize_card(card) for card in _list_at(card_select, "preview_cards")),
+        card_select_is_consume=card_select_ops["consume"],
+        card_select_is_upgrade=card_select_ops["upgrade"],
+        card_select_is_remove=card_select_ops["remove"],
+        card_select_is_enchant=card_select_ops["enchant"],
         card_select_can_confirm=bool(card_select.get("can_confirm")),
         card_select_can_cancel=bool(card_select.get("can_cancel") or card_select.get("can_skip")),
         bundle_cards=_flatten_bundle_cards(bundle_select),
@@ -886,6 +1804,10 @@ def normalize_semantic_state(state: dict[str, object]) -> SemanticState:
         bundle_can_cancel=bool(bundle_select.get("can_cancel")),
         hand_select_cards=tuple(_normalize_card(card) for card in _list_at(hand_select, "cards")),
         hand_select_selected_cards=tuple(_normalize_card(card) for card in _list_at(hand_select, "selected_cards")),
+        hand_select_is_consume=hand_select_ops["consume"],
+        hand_select_is_upgrade=hand_select_ops["upgrade"],
+        hand_select_is_remove=hand_select_ops["remove"],
+        hand_select_is_enchant=hand_select_ops["enchant"],
         hand_select_can_confirm=bool(hand_select.get("can_confirm")),
         relic_select_relics=tuple(_normalize_relic(relic) for relic in _list_at(relic_select, "relics")),
         relic_select_can_skip=bool(relic_select.get("can_skip")),
@@ -919,8 +1841,9 @@ def _candidate_concept_keys(value: object, prefixes: tuple[str, ...]) -> list[st
 
 
 def _activate_key(active_keys: set[str], catalog: SemanticCatalog, key: str) -> None:
-    if key in catalog.concept_index:
-        active_keys.add(key)
+    normalized = _normalize_model_token(key)
+    if normalized in catalog.concept_index:
+        active_keys.add(normalized)
 
 
 def _activate_prefixed(active_keys: set[str], catalog: SemanticCatalog, value: object, *prefixes: str) -> None:
@@ -944,10 +1867,15 @@ def activate_state_concepts(
         return ConceptActivation(active_keys=(), vector=[])
 
     _activate_runtime(active_keys, catalog, "STATE_TYPE", semantic_state.state_type)
+    _activate_runtime(active_keys, catalog, "COMBAT_ROUND_BUCKET", combat_round_bucket(semantic_state.battle_round))
     _activate_prefixed(active_keys, catalog, semantic_state.act_id, "ACT")
     _activate_prefixed(active_keys, catalog, semantic_state.character_id, "CHARACTER")
     _activate_prefixed(active_keys, catalog, semantic_state.encounter_id, "ENCOUNTER")
     _activate_prefixed(active_keys, catalog, semantic_state.event_id, "EVENT", "ANCIENT")
+    encounter_token = semantic_state.encounter_id.split(".")[-1] if semantic_state.encounter_id else ""
+    round_bucket = combat_round_bucket(semantic_state.battle_round)
+    if encounter_token:
+        _activate_key(active_keys, catalog, f"ENCOUNTER_ROUND.{encounter_token}.{round_bucket}")
 
     for power in semantic_state.player_powers:
         _activate_prefixed(active_keys, catalog, power.id, "POWER")
@@ -963,6 +1891,27 @@ def activate_state_concepts(
         _activate_runtime(active_keys, catalog, "TARGET_TYPE", potion.target_type)
     for orb_id in semantic_state.orb_ids:
         _activate_prefixed(active_keys, catalog, orb_id, "ORB")
+
+    for card in semantic_state.hand:
+        if card.index < 0 or card.index >= HAND_SLOT_COUNT:
+            continue
+        slot_token = f"SLOT_{card.index}"
+        _activate_prefixed(active_keys, catalog, card.id, f"HAND_SLOT_CARD.{slot_token}")
+
+    card_select_operations = {
+        "CONSUME": semantic_state.card_select_is_consume,
+        "UPGRADE": semantic_state.card_select_is_upgrade,
+        "REMOVE": semantic_state.card_select_is_remove,
+        "ENCHANT": semantic_state.card_select_is_enchant,
+    }
+    for card in semantic_state.card_select_cards:
+        if card.index < 0 or card.index >= CARD_SELECT_SLOT_COUNT:
+            continue
+        slot_token = f"SLOT_{card.index}"
+        _activate_prefixed(active_keys, catalog, card.id, f"CARD_SELECT_SLOT_CARD.{slot_token}")
+        for operation, enabled in card_select_operations.items():
+            if enabled:
+                _activate_key(active_keys, catalog, f"CARD_SELECT_SLOT_OPERATION.{slot_token}.{operation}")
 
     for card_group in (
         semantic_state.hand,
@@ -992,6 +1941,10 @@ def activate_state_concepts(
         monster_token = enemy.monster_id.split(".")[-1] if enemy.monster_id else ""
         _activate_prefixed(active_keys, catalog, enemy.monster_id, "MONSTER")
         _activate_prefixed(active_keys, catalog, f"MONSTER_MOVE.{monster_token}.{enemy.move_id}", "MONSTER_MOVE")
+        if monster_token:
+            _activate_key(active_keys, catalog, f"MONSTER_ROUND.{monster_token}.{round_bucket}")
+            if enemy.move_id:
+                _activate_key(active_keys, catalog, f"MONSTER_MOVE_ROUND.{monster_token}.{enemy.move_id}.{round_bucket}")
         for intent_type in enemy.intent_types:
             _activate_runtime(active_keys, catalog, "INTENT_TYPE", intent_type)
         for power in enemy.powers:
@@ -1005,6 +1958,37 @@ def activate_state_concepts(
         _activate_runtime(active_keys, catalog, "POTION_RARITY", reward_item.potion_rarity)
         _activate_runtime(active_keys, catalog, "POTION_USAGE", reward_item.potion_usage)
 
+    for option in semantic_state.event_options:
+        if option.index < 0 or option.index >= EVENT_OPTION_COUNT:
+            continue
+        option_token = f"OPTION_{option.index}"
+        if semantic_state.event_id:
+            event_token = semantic_state.event_id.split(".")[-1]
+            _activate_key(active_keys, catalog, f"EVENT_OPTION_SLOT.{event_token}.{option_token}")
+        _activate_key(active_keys, catalog, f"EVENT_OPTION_KIND.{option_token}.{event_option_kind(option)}")
+        _activate_prefixed(active_keys, catalog, option.relic_id, f"EVENT_OPTION_RELIC.{option_token}")
+        _activate_prefixed(active_keys, catalog, option.card_id, f"EVENT_OPTION_CARD.{option_token}")
+        _activate_prefixed(active_keys, catalog, option.potion_id, f"EVENT_OPTION_POTION.{option_token}")
+
+    selected_hand_indices = {card.index for card in semantic_state.hand_select_selected_cards if card.index >= 0}
+    selected_hand_ids = {card.id for card in semantic_state.hand_select_selected_cards if card.id}
+    hand_select_operations = {
+        "CONSUME": semantic_state.hand_select_is_consume,
+        "UPGRADE": semantic_state.hand_select_is_upgrade,
+        "REMOVE": semantic_state.hand_select_is_remove,
+        "ENCHANT": semantic_state.hand_select_is_enchant,
+    }
+    for card in semantic_state.hand_select_cards:
+        if card.index < 0 or card.index >= HAND_SELECT_SLOT_COUNT:
+            continue
+        slot_token = f"SLOT_{card.index}"
+        _activate_prefixed(active_keys, catalog, card.id, f"HAND_SELECT_SLOT_CARD.{slot_token}")
+        for operation, enabled in hand_select_operations.items():
+            if enabled:
+                _activate_key(active_keys, catalog, f"HAND_SELECT_SLOT_OPERATION.{slot_token}.{operation}")
+        if card.index in selected_hand_indices or card.id in selected_hand_ids:
+            _activate_key(active_keys, catalog, f"HAND_SELECT_SELECTED.{slot_token}")
+
     for shop_group in (semantic_state.shop_items, semantic_state.fake_merchant_shop_items):
         for item in shop_group:
             _activate_prefixed(active_keys, catalog, item.card_id, "CARD")
@@ -1015,6 +1999,31 @@ def activate_state_concepts(
             _activate_runtime(active_keys, catalog, "RELIC_RARITY", item.relic_rarity)
             _activate_runtime(active_keys, catalog, "POTION_RARITY", item.potion_rarity)
             _activate_runtime(active_keys, catalog, "POTION_USAGE", item.potion_usage)
+            if 0 <= item.index < SHOP_SLOT_COUNT:
+                slot_token = f"SLOT_{item.index}"
+                _activate_key(active_keys, catalog, f"SHOP_SLOT_CATEGORY.{slot_token}.{_slugify(item.category) or 'UNKNOWN'}")
+                _activate_key(active_keys, catalog, f"SHOP_SLOT_ITEM.{slot_token}.{item.item_token or 'SPECIAL.UNKNOWN'}")
+
+    if semantic_state.map_remaining_dominant_type:
+        _activate_key(active_keys, catalog, f"MAP_REMAINING_DOMINANT.{semantic_state.map_remaining_dominant_type}")
+    for node_type in MAP_NODE_TYPES:
+        if map_type_count(semantic_state.map_remaining_type_counts, node_type) > 0:
+            _activate_key(active_keys, catalog, f"MAP_REMAINING_HAS.{node_type}")
+    for depth_index, depth_label in enumerate(MAP_ROUTE_DEPTH_LABELS):
+        dominant_type = map_depth_dominant_type(semantic_state.map_remaining_depth_type_counts, depth_index)
+        _activate_key(active_keys, catalog, f"MAP_REMAINING_DEPTH.{depth_label}.{dominant_type}")
+
+    for route in semantic_state.map_route_summaries:
+        if route.option_index < 0 or route.option_index >= MAP_ROUTE_OPTION_COUNT:
+            continue
+        option_token = f"OPTION_{route.option_index}"
+        _activate_key(active_keys, catalog, f"MAP_OPTION_TYPE.{option_token}.{route.option_type}")
+        _activate_key(active_keys, catalog, f"MAP_ROUTE_DOMINANT.{option_token}.{route.dominant_type}")
+        for node_type in MAP_NODE_TYPES:
+            if map_type_count(route.type_counts, node_type) > 0:
+                _activate_key(active_keys, catalog, f"MAP_ROUTE_HAS.{option_token}.{node_type}")
+        for depth_label, dominant_type in zip(MAP_ROUTE_DEPTH_LABELS, route.depth_dominant_types):
+            _activate_key(active_keys, catalog, f"MAP_ROUTE_DEPTH.{option_token}.{depth_label}.{dominant_type}")
 
     for option_group in (semantic_state.map_options, semantic_state.event_options, semantic_state.rest_options):
         for option in option_group:
@@ -1043,6 +2052,12 @@ def _count_cards_by_target(cards: tuple[SemanticCard, ...], predicate: set[str],
     )
 
 
+def _visible_shop_items(state: SemanticState) -> tuple[SemanticShopItem, ...]:
+    if state.state_type == "fake_merchant":
+        return state.fake_merchant_shop_items
+    return state.shop_items
+
+
 def _build_scalar_features(state: SemanticState) -> _FeatureBuilder:
     builder = _FeatureBuilder()
     playable_cards = state.playable_cards
@@ -1058,6 +2073,11 @@ def _build_scalar_features(state: SemanticState) -> _FeatureBuilder:
     enemy_buff_intents = sum(1 for enemy in state.living_enemies for intent in enemy.intent_types if intent == "BUFF")
     enemy_debuff_intents = sum(1 for enemy in state.living_enemies for intent in enemy.intent_types if "DEBUFF" in intent)
     map_special_count = sum(1 for option in state.map_options if option.option_type in {"RestSite", "Shop", "Event", "Treasure", "Boss"})
+    map_route_scores = [route.route_score for route in state.map_route_summaries]
+    map_best_route_score = max(map_route_scores, default=0.0)
+    map_mean_route_score = sum(map_route_scores) / max(len(map_route_scores), 1)
+    map_path_count_total = sum(route.path_count for route in state.map_route_summaries)
+    visible_shop_items = _visible_shop_items(state)
     event_unlocked_count = sum(1 for option in state.event_options if not option.is_locked)
     rest_enabled_count = sum(1 for option in state.rest_options if option.is_enabled)
 
@@ -1099,19 +2119,178 @@ def _build_scalar_features(state: SemanticState) -> _FeatureBuilder:
     builder.add("enemy_power_count_norm", _ratio(enemy_power_count, 20.0, 2.0))
     builder.add("reward_item_count_norm", _ratio(len(state.reward_items), 5.0, 2.0))
     builder.add("card_reward_count_norm", _ratio(len(state.card_reward_cards), 3.0, 2.0))
+    builder.add("map_remaining_node_count_norm", _ratio(state.map_remaining_node_count, 40.0, 2.0))
+    builder.add("map_remaining_boss_distance_norm", _ratio(max(0, state.map_remaining_boss_distance), 15.0, 2.0))
+    builder.add("map_best_route_score_norm", _ratio(map_best_route_score, 12.0, 2.0))
+    builder.add("map_mean_route_score_norm", _ratio(map_mean_route_score, 12.0, 2.0))
+    builder.add("map_path_count_total_norm", _ratio(map_path_count_total, 24.0, 2.0))
     builder.add("map_option_count_norm", _ratio(len(state.map_options), 6.0, 2.0))
     builder.add("map_special_option_count_norm", _ratio(map_special_count, 6.0, 2.0))
+    for node_type in MAP_ROUTE_TRACKED_TYPES:
+        builder.add(
+            f"map_remaining_ratio.{node_type}",
+            map_type_ratio(state.map_remaining_type_counts, node_type),
+        )
+    for depth_index, depth_label in enumerate(MAP_ROUTE_DEPTH_LABELS):
+        for node_type in MAP_ROUTE_TRACKED_TYPES:
+            builder.add(
+                f"map_remaining_depth_ratio.{depth_label}.{node_type}",
+                map_depth_type_ratio(state.map_remaining_depth_type_counts, depth_index, node_type),
+            )
+    route_by_index = {route.option_index: route for route in state.map_route_summaries}
+    for option_index in range(MAP_ROUTE_OPTION_COUNT):
+        route = route_by_index.get(option_index)
+        prefix = f"map_route.{option_index}"
+        builder.add(f"{prefix}.available", _bool(route is not None))
+        builder.add(f"{prefix}.reachable_count_norm", _ratio(route.reachable_count if route else 0, 20.0, 2.0))
+        builder.add(f"{prefix}.path_count_norm", _ratio(route.path_count if route else 0, 12.0, 2.0))
+        builder.add(f"{prefix}.boss_distance_norm", _ratio(max(0, route.boss_distance) if route else 0, 15.0, 2.0))
+        builder.add(f"{prefix}.route_score_norm", _ratio(route.route_score if route else 0.0, 12.0, 2.0))
+        for node_type in MAP_ROUTE_TRACKED_TYPES:
+            builder.add(
+                f"{prefix}.ratio.{node_type}",
+                map_type_ratio(route.type_counts, node_type) if route else 0.0,
+            )
+        for depth_index, depth_label in enumerate(MAP_ROUTE_DEPTH_LABELS):
+            for node_type in MAP_ROUTE_TRACKED_TYPES:
+                builder.add(
+                    f"{prefix}.depth_ratio.{depth_label}.{node_type}",
+                    map_depth_type_ratio(route.depth_type_counts, depth_index, node_type) if route else 0.0,
+                )
+
+    hand_by_index = {card.index: card for card in state.hand if 0 <= card.index < HAND_SLOT_COUNT}
+    for slot_index in range(HAND_SLOT_COUNT):
+        card = hand_by_index.get(slot_index)
+        prefix = f"hand_slot.{slot_index}"
+        enchantment_count = len(card.enchantments) if card else 0
+        affliction_count = len(card.afflictions) if card else 0
+        builder.add(f"{prefix}.present", _bool(card is not None))
+        builder.add(f"{prefix}.playable", _bool(card is not None and card.can_play))
+        builder.add(f"{prefix}.cost_norm", _ratio(_cost_units(card.cost, state.player_energy) if card else 0.0, 5.0, 2.0))
+        builder.add(f"{prefix}.is_attack", _bool(card is not None and card.card_type == "Attack"))
+        builder.add(f"{prefix}.is_skill", _bool(card is not None and card.card_type == "Skill"))
+        builder.add(f"{prefix}.is_power", _bool(card is not None and card.card_type == "Power"))
+        builder.add(f"{prefix}.is_status", _bool(card is not None and card.card_type == "Status"))
+        builder.add(f"{prefix}.is_curse", _bool(card is not None and card.card_type == "Curse"))
+        builder.add(f"{prefix}.targets_enemy", _bool(card is not None and _match_token(card.target_type, ENEMY_TARGET_TYPES)))
+        builder.add(f"{prefix}.targets_all_enemy", _bool(card is not None and _match_token(card.target_type, ALL_ENEMY_TARGET_TYPES)))
+        builder.add(f"{prefix}.targets_self", _bool(card is not None and _match_token(card.target_type, SELF_TARGET_TYPES)))
+        builder.add(f"{prefix}.consumes_on_play", _bool(card is not None and card.consumes_on_play))
+        builder.add(f"{prefix}.upgraded", _bool(card is not None and card.is_upgraded))
+        builder.add(f"{prefix}.enchantment_count_norm", _ratio(enchantment_count, 4.0, 2.0))
+        builder.add(f"{prefix}.affliction_count_norm", _ratio(affliction_count, 4.0, 2.0))
+        builder.add(f"{prefix}.op_consume", _bool(card is not None and card.consumes_on_play))
+        builder.add(f"{prefix}.op_upgrade", _bool(card is not None and card.is_upgraded))
+        builder.add(f"{prefix}.op_remove", 0.0)
+        builder.add(f"{prefix}.op_enchant", _bool(card is not None and enchantment_count > 0))
+
+    card_select_by_index = {card.index: card for card in state.card_select_cards if 0 <= card.index < CARD_SELECT_SLOT_COUNT}
+    for slot_index in range(CARD_SELECT_SLOT_COUNT):
+        card = card_select_by_index.get(slot_index)
+        prefix = f"card_select_slot.{slot_index}"
+        enchantment_count = len(card.enchantments) if card else 0
+        affliction_count = len(card.afflictions) if card else 0
+        builder.add(f"{prefix}.present", _bool(card is not None))
+        builder.add(f"{prefix}.playable", _bool(card is not None and card.can_play))
+        builder.add(f"{prefix}.cost_norm", _ratio(_cost_units(card.cost, state.player_energy) if card else 0.0, 5.0, 2.0))
+        builder.add(f"{prefix}.is_attack", _bool(card is not None and card.card_type == "Attack"))
+        builder.add(f"{prefix}.is_skill", _bool(card is not None and card.card_type == "Skill"))
+        builder.add(f"{prefix}.is_power", _bool(card is not None and card.card_type == "Power"))
+        builder.add(f"{prefix}.is_status", _bool(card is not None and card.card_type == "Status"))
+        builder.add(f"{prefix}.is_curse", _bool(card is not None and card.card_type == "Curse"))
+        builder.add(f"{prefix}.consumes_on_play", _bool(card is not None and card.consumes_on_play))
+        builder.add(f"{prefix}.upgraded", _bool(card is not None and card.is_upgraded))
+        builder.add(f"{prefix}.enchantment_count_norm", _ratio(enchantment_count, 4.0, 2.0))
+        builder.add(f"{prefix}.affliction_count_norm", _ratio(affliction_count, 4.0, 2.0))
+        builder.add(f"{prefix}.op_consume", _bool(card is not None and state.card_select_is_consume))
+        builder.add(f"{prefix}.op_upgrade", _bool(card is not None and state.card_select_is_upgrade))
+        builder.add(f"{prefix}.op_remove", _bool(card is not None and state.card_select_is_remove))
+        builder.add(f"{prefix}.op_enchant", _bool(card is not None and state.card_select_is_enchant))
+
+    shop_item_by_index = {item.index: item for item in visible_shop_items if 0 <= item.index < SHOP_SLOT_COUNT}
+    for slot_index in range(SHOP_SLOT_COUNT):
+        item = shop_item_by_index.get(slot_index)
+        prefix = f"shop_slot.{slot_index}"
+        builder.add(f"{prefix}.present", _bool(item is not None))
+        builder.add(f"{prefix}.stocked", _bool(item.is_stocked if item else False))
+        builder.add(f"{prefix}.affordable", _bool(item.can_afford if item else False))
+        builder.add(f"{prefix}.price_norm", _ratio(item.price if item else 0.0, 250.0, 2.0))
+        builder.add(f"{prefix}.is_card", _bool(item is not None and item.category == "card"))
+        builder.add(f"{prefix}.is_relic", _bool(item is not None and item.category == "relic"))
+        builder.add(f"{prefix}.is_potion", _bool(item is not None and item.category == "potion"))
+        builder.add(f"{prefix}.is_card_removal", _bool(item is not None and item.category == "card_removal"))
+    event_option_by_index = {option.index: option for option in state.event_options if 0 <= option.index < EVENT_OPTION_COUNT}
+    for option_index in range(EVENT_OPTION_COUNT):
+        option = event_option_by_index.get(option_index)
+        prefix = f"event_slot.{option_index}"
+        kind = event_option_kind(option)
+        text_length = len(f"{option.title} {option.description}".strip()) if option else 0
+        builder.add(f"{prefix}.present", _bool(option is not None))
+        builder.add(f"{prefix}.available", _bool(option is not None and not option.is_locked))
+        builder.add(f"{prefix}.locked", _bool(option is not None and option.is_locked))
+        builder.add(f"{prefix}.proceed", _bool(option is not None and option.is_proceed))
+        builder.add(f"{prefix}.chosen", _bool(option is not None and option.was_chosen))
+        builder.add(f"{prefix}.has_relic", _bool(option is not None and bool(option.relic_id)))
+        builder.add(f"{prefix}.has_card", _bool(option is not None and bool(option.card_id)))
+        builder.add(f"{prefix}.has_potion", _bool(option is not None and bool(option.potion_id)))
+        builder.add(f"{prefix}.has_keywords", _bool(option is not None and bool(option.keyword_tokens)))
+        builder.add(f"{prefix}.has_text", _bool(option is not None and bool(option.title or option.description)))
+        builder.add(f"{prefix}.kind_proceed", _bool(kind == "PROCEED"))
+        builder.add(f"{prefix}.kind_relic", _bool(kind == "RELIC"))
+        builder.add(f"{prefix}.kind_card", _bool(kind == "CARD"))
+        builder.add(f"{prefix}.kind_potion", _bool(kind == "POTION"))
+        builder.add(f"{prefix}.kind_keyword", _bool(kind == "KEYWORD"))
+        builder.add(f"{prefix}.kind_text", _bool(kind == "TEXT"))
+        builder.add(f"{prefix}.keyword_count_norm", _ratio(len(option.keyword_tokens) if option else 0, 4.0, 2.0))
+        builder.add(f"{prefix}.text_length_norm", _ratio(text_length, 200.0, 2.0))
+    hand_select_by_index = {card.index: card for card in state.hand_select_cards if 0 <= card.index < HAND_SELECT_SLOT_COUNT}
+    selected_hand_indices = {card.index for card in state.hand_select_selected_cards if card.index >= 0}
+    selected_hand_ids = {card.id for card in state.hand_select_selected_cards if card.id}
+    for slot_index in range(HAND_SELECT_SLOT_COUNT):
+        card = hand_select_by_index.get(slot_index)
+        prefix = f"hand_select_slot.{slot_index}"
+        is_selected = bool(card is not None and (card.index in selected_hand_indices or card.id in selected_hand_ids))
+        enchantment_count = len(card.enchantments) if card else 0
+        affliction_count = len(card.afflictions) if card else 0
+        builder.add(f"{prefix}.present", _bool(card is not None))
+        builder.add(f"{prefix}.selected", _bool(is_selected))
+        builder.add(f"{prefix}.playable", _bool(card is not None and card.can_play))
+        builder.add(f"{prefix}.cost_norm", _ratio(_cost_units(card.cost, state.player_energy) if card else 0.0, 5.0, 2.0))
+        builder.add(f"{prefix}.is_attack", _bool(card is not None and card.card_type == "Attack"))
+        builder.add(f"{prefix}.is_skill", _bool(card is not None and card.card_type == "Skill"))
+        builder.add(f"{prefix}.is_power", _bool(card is not None and card.card_type == "Power"))
+        builder.add(f"{prefix}.is_status", _bool(card is not None and card.card_type == "Status"))
+        builder.add(f"{prefix}.is_curse", _bool(card is not None and card.card_type == "Curse"))
+        builder.add(f"{prefix}.targets_enemy", _bool(card is not None and _match_token(card.target_type, ENEMY_TARGET_TYPES)))
+        builder.add(f"{prefix}.targets_all_enemy", _bool(card is not None and _match_token(card.target_type, ALL_ENEMY_TARGET_TYPES)))
+        builder.add(f"{prefix}.targets_self", _bool(card is not None and _match_token(card.target_type, SELF_TARGET_TYPES)))
+        builder.add(f"{prefix}.consumes_on_play", _bool(card is not None and card.consumes_on_play))
+        builder.add(f"{prefix}.upgraded", _bool(card is not None and card.is_upgraded))
+        builder.add(f"{prefix}.enchantment_count_norm", _ratio(enchantment_count, 4.0, 2.0))
+        builder.add(f"{prefix}.affliction_count_norm", _ratio(affliction_count, 4.0, 2.0))
+        builder.add(f"{prefix}.op_consume", _bool(card is not None and state.hand_select_is_consume))
+        builder.add(f"{prefix}.op_upgrade", _bool(card is not None and state.hand_select_is_upgrade))
+        builder.add(f"{prefix}.op_remove", _bool(card is not None and state.hand_select_is_remove))
+        builder.add(f"{prefix}.op_enchant", _bool(card is not None and state.hand_select_is_enchant))
     builder.add("event_option_count_norm", _ratio(len(state.event_options), 5.0, 2.0))
     builder.add("event_unlocked_option_count_norm", _ratio(event_unlocked_count, 5.0, 2.0))
     builder.add("rest_option_count_norm", _ratio(len(state.rest_options), 5.0, 2.0))
     builder.add("rest_enabled_option_count_norm", _ratio(rest_enabled_count, 5.0, 2.0))
     builder.add("card_select_count_norm", _ratio(len(state.card_select_cards), 20.0, 2.0))
     builder.add("card_select_preview_count_norm", _ratio(len(state.card_select_preview_cards), 20.0, 2.0))
+    builder.add("card_select_is_consume", _bool(state.card_select_is_consume))
+    builder.add("card_select_is_upgrade", _bool(state.card_select_is_upgrade))
+    builder.add("card_select_is_remove", _bool(state.card_select_is_remove))
+    builder.add("card_select_is_enchant", _bool(state.card_select_is_enchant))
     builder.add("bundle_count_norm", _ratio(state.bundle_count, 3.0, 2.0))
     builder.add("bundle_card_count_norm", _ratio(len(state.bundle_cards), 9.0, 2.0))
     builder.add("bundle_preview_count_norm", _ratio(len(state.bundle_preview_cards), 9.0, 2.0))
     builder.add("hand_select_count_norm", _ratio(len(state.hand_select_cards), 10.0, 2.0))
     builder.add("hand_select_selected_count_norm", _ratio(len(state.hand_select_selected_cards), 10.0, 2.0))
+    builder.add("hand_select_is_consume", _bool(state.hand_select_is_consume))
+    builder.add("hand_select_is_upgrade", _bool(state.hand_select_is_upgrade))
+    builder.add("hand_select_is_remove", _bool(state.hand_select_is_remove))
+    builder.add("hand_select_is_enchant", _bool(state.hand_select_is_enchant))
     builder.add("relic_select_count_norm", _ratio(len(state.relic_select_relics), 3.0, 2.0))
     builder.add("treasure_relic_count_norm", _ratio(len(state.treasure_relics), 3.0, 2.0))
     builder.add("shop_item_count_norm", _ratio(len(state.shop_items), 12.0, 2.0))
@@ -1140,10 +2319,12 @@ def encode_state_semantic_scalars(state: dict[str, object] | SemanticState) -> l
     return _build_scalar_features(ensure_semantic_state(state)).values
 
 
-def _build_relation_features(state: SemanticState) -> _FeatureBuilder:
+def _build_relation_features(state: SemanticState, history: SemanticHistoryTracker | None = None) -> _FeatureBuilder:
     builder = _FeatureBuilder()
     playable_count = len(state.playable_cards)
     living_enemy_count = len(state.living_enemies)
+    hand_order_profile = history.hand_order_profile if history is not None else build_hand_order_profile(state)
+    hand_order_slots = hand_order_profile.available_slots
     incoming_damage = state.incoming_damage
     max_hp = max(state.player_max_hp, 1.0)
     block_gap = max(0.0, incoming_damage - state.player_block)
@@ -1181,6 +2362,9 @@ def _build_relation_features(state: SemanticState) -> _FeatureBuilder:
     )
     reward_pressure = len(state.reward_items) + len(state.card_reward_cards) + len(state.relic_select_relics) + len(state.treasure_relics)
     selection_pressure = len(state.card_select_cards) + len(state.bundle_cards) + len(state.hand_select_cards)
+    map_route_scores = [route.route_score for route in state.map_route_summaries]
+    map_best_route_score = max(map_route_scores, default=0.0)
+    map_worst_route_score = min(map_route_scores, default=0.0)
 
     builder.add("in_combat", _bool(state.in_combat))
     builder.add("is_player_turn", _bool(state.is_player_turn))
@@ -1205,17 +2389,51 @@ def _build_relation_features(state: SemanticState) -> _FeatureBuilder:
     builder.add("selection_ready", _bool(selection_ready))
     builder.add("proceed_ready", _bool(proceed_ready))
     builder.add("map_branching_norm", _ratio(len(state.map_options), 6.0, 2.0))
+    builder.add("map_remaining_boss_distance_norm", _ratio(max(0, state.map_remaining_boss_distance), 15.0, 2.0))
+    builder.add("map_best_route_score_norm", _ratio(map_best_route_score, 12.0, 2.0))
+    builder.add("map_route_score_gap_norm", _ratio(max(0.0, map_best_route_score - map_worst_route_score), 8.0, 2.0))
+    builder.add("map_elite_remaining_ratio", map_type_ratio(state.map_remaining_type_counts, "Elite"))
+    builder.add("map_rest_remaining_ratio", map_type_ratio(state.map_remaining_type_counts, "RestSite"))
+    builder.add("map_shop_remaining_ratio", map_type_ratio(state.map_remaining_type_counts, "Shop"))
+    builder.add("map_event_remaining_ratio", map_type_ratio(state.map_remaining_type_counts, "Event"))
+    builder.add("map_treasure_remaining_ratio", map_type_ratio(state.map_remaining_type_counts, "Treasure"))
     builder.add("event_branching_norm", _safe_div(sum(1 for option in state.event_options if not option.is_locked), max(len(state.event_options), 1)))
     builder.add("rest_choice_ratio", _safe_div(sum(1 for option in state.rest_options if option.is_enabled), max(len(state.rest_options), 1)))
     builder.add("potion_overflow_risk", _bool(full_potion_slots and reward_has_potion))
     builder.add("card_select_preview_ratio", _safe_div(len(state.card_select_preview_cards), max(len(state.card_select_cards), 1)))
     builder.add("bundle_preview_ratio", _safe_div(len(state.bundle_preview_cards), max(len(state.bundle_cards), 1)))
     builder.add("crystal_work_remaining_norm", _ratio(state.crystal_clickable_count, 8.0, 2.0))
+    builder.add("hand_order_slot_count_norm", _ratio(len(hand_order_slots), HAND_SLOT_COUNT, 2.0))
+    builder.add(
+        "hand_order_edge_density",
+        _safe_div(sum(hand_order_profile.slot_before_counts), max(len(hand_order_slots) * max(len(hand_order_slots) - 1, 0), 1)),
+    )
+    for slot_index in range(HAND_SLOT_COUNT):
+        before_count = hand_order_profile.slot_before_counts[slot_index]
+        after_count = hand_order_profile.slot_after_counts[slot_index]
+        builder.add(f"hand_order_slot.{slot_index}.priority_norm", _signed_ratio(hand_order_profile.slot_priorities[slot_index], HAND_ORDER_PRIORITY_SCALE, 1.0))
+        builder.add(f"hand_order_slot.{slot_index}.before_count_norm", _ratio(before_count, HAND_SLOT_COUNT - 1, 1.0))
+        builder.add(f"hand_order_slot.{slot_index}.after_count_norm", _ratio(after_count, HAND_SLOT_COUNT - 1, 1.0))
+        builder.add(f"hand_order_slot.{slot_index}.prefer_early", _bool(before_count > after_count))
+        builder.add(f"hand_order_slot.{slot_index}.prefer_late", _bool(after_count > before_count))
+    for left_index in range(HAND_SLOT_COUNT):
+        for right_index in range(left_index + 1, HAND_SLOT_COUNT):
+            builder.add(
+                f"hand_order_pair.{left_index}.{right_index}.left_before_right",
+                _bool(hand_order_profile.pair_prefer_before[left_index][right_index]),
+            )
+            builder.add(
+                f"hand_order_pair.{left_index}.{right_index}.right_before_left",
+                _bool(hand_order_profile.pair_prefer_before[right_index][left_index]),
+            )
     return builder
 
 
-def encode_state_relation_semantics(state: dict[str, object] | SemanticState) -> list[float]:
-    return _build_relation_features(ensure_semantic_state(state)).values
+def encode_state_relation_semantics(
+    state: dict[str, object] | SemanticState,
+    history: SemanticHistoryTracker | None = None,
+) -> list[float]:
+    return _build_relation_features(ensure_semantic_state(state), history).values
 
 
 def _action_bucket(
@@ -1298,6 +2516,9 @@ def _build_history_features(state: SemanticState, history: SemanticHistoryTracke
     builder.add("last_act_end", _bool(tracker.last_act_end))
     builder.add("last_run_end", _bool(tracker.last_run_end))
     builder.add("last_turn_skipped_unspent", _bool(tracker.last_turn_skipped_unspent))
+    builder.add("last_hand_order_refresh", _bool(tracker.last_hand_order_refresh))
+    builder.add("last_hand_order_refresh_turn_start", _bool(tracker.last_hand_order_refresh_turn_start))
+    builder.add("last_hand_order_refresh_hand_changed", _bool(tracker.last_hand_order_refresh_hand_changed))
     builder.add("last_enemy_hp_progress_norm", _ratio(tracker.last_enemy_hp_progress, 50.0, 2.0))
     builder.add("last_player_hp_loss_norm", _ratio(tracker.last_player_hp_loss, 50.0, 2.0))
     builder.add("turn_step_count_norm", _ratio(tracker.turn_step_count, 10.0, 2.0))
@@ -1310,6 +2531,7 @@ def _build_history_features(state: SemanticState, history: SemanticHistoryTracke
     builder.add("turn_energy_spent_norm", _ratio(tracker.turn_energy_spent, 10.0, 2.0))
     builder.add("turn_enemy_damage_norm", _ratio(tracker.turn_enemy_damage, 60.0, 2.0))
     builder.add("turn_player_damage_norm", _ratio(tracker.turn_player_damage, 60.0, 2.0))
+    builder.add("turn_hand_order_refreshes_norm", _ratio(tracker.turn_hand_order_refreshes, 6.0, 2.0))
     builder.add("combat_step_count_norm", _ratio(tracker.combat_step_count, 60.0, 2.0))
     builder.add("combat_cards_played_norm", _ratio(tracker.combat_cards_played, 40.0, 2.0))
     builder.add("combat_potions_used_norm", _ratio(tracker.combat_potions_used, 6.0, 2.0))
@@ -1347,7 +2569,7 @@ def encode_semantic_observation(
         semantic_state = history.sync_state(semantic_state)
     concept_activation = activate_state_concepts(semantic_state, catalog or DEFAULT_SEMANTIC_CATALOG)
     scalar_vector = encode_state_semantic_scalars(semantic_state)
-    relation_vector = encode_state_relation_semantics(semantic_state)
+    relation_vector = encode_state_relation_semantics(semantic_state, history)
     history_vector = encode_state_history_semantics(semantic_state, history)
     vector = concept_activation.vector + scalar_vector + relation_vector + history_vector
     return SemanticObservation(
