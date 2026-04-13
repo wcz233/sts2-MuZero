@@ -62,6 +62,54 @@ python run_training.py --enable-episode-logs
 python run_training.py --enable-episode-logs --episode-log-dir episode_logs --episode-log-model-name latest
 ```
 
+Example training configuration:
+
+```powershell
+python .\run_training.py `
+  --max-steps 50000 `
+  --simulations 40 `
+  --combat-selection-simulations 10 `
+  --combat-selection-search-time-budget-seconds 0.03 `
+  --learning-rate 1.5e-4 `
+  --discount 0.997 `
+  --updates-per-episode 8 `
+  --replay-capacity 20000 `
+  --warmup-samples 1500 `
+  --temperature 0.45 `
+  --checkpoint-path checkpoints\ep_v1.json `
+  --checkpoint-interval 250 `
+  --character Ironclad `
+  --ascension 0 `
+  --floor-advance-weight 0.10 `
+  --act-advance-weight 6.0 `
+  --hp-delta-weight 5.0 `
+  --gold-delta-weight 0.25 `
+  --gold-delta-scale 25 `
+  --enemy-hp-delta-weight 8.0 `
+  --turn-end-weight 0.0 `
+  --turn-skip-unspent-penalty 6.0 `
+  --combat-end-weight 6.0 `
+  --combat-defeat-weight -10.0 `
+  --act-end-weight 2.0 `
+  --run-victory-weight 12.0 `
+  --run-defeat-weight -18.0 `
+  --combat-tactical-shaping 0.30 `
+  --end-turn-slack-penalty 0.0 `
+  --episode-settlement-weight 0.15 `
+  --episode-settlement-decay 0.995 `
+  --settlement-signal-mode mean `
+  --settlement-normalization sum `
+  --settlement-clip 6 `
+  --card-select-candidate-limit 6 `
+  --end-turn-guard-timeout-seconds 2.5 `
+  --card-reward-preview-guard-timeout-seconds 2.5 `
+  --map-route-defeat-gold-threshold 250 `
+  --map-route-defeat-gold-penalty-multiplier 2.0 `
+  --enable-episode-logs `
+  --map-route-choice-weight 1.5 `
+  --resume
+```
+
 Episode log flags:
 
 - `--enable-episode-logs`
